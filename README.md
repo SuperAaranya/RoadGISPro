@@ -1,30 +1,51 @@
-# RoadGISPro
+﻿# RoadGISPro
 
-RoadGISPro is a **free, no-ads, open-source GIS project** focused on practical mapping and road-related geospatial work.
+RoadGISPro is a desktop GIS tool for creating and editing road networks, then running fastest-time routing on those roads.
 
-## Project Values
+## Highlights
 
-- **Free to use** — no paywalls.
-- **No ads** — the project should stay clean and user-focused.
-- **Open source** — transparent development.
-- **Community contributions welcome** — anyone can help, as long as they follow the contribution rules.
+- Draw and edit road geometries with snapping.
+- Store rich attributes per road:
+  - road class/type
+  - speed limit
+  - lane count
+  - one-way direction
+  - tunnel / lighting flags
+  - bridge level
+  - max weight
+  - surface type
+- Fastest-time routing using your road attributes.
+- Undo/redo, copy/paste, zoom fit, layer clearing.
+- Save/load custom `.rgis` format and export/import JSON.
+
+## Route Tool
+
+1. Draw roads and commit them (right-click in Draw mode).
+2. Switch to `Route` mode (`R` key or toolbar button).
+3. Click a start point near a road vertex.
+4. Click a destination point near a road vertex.
+5. RoadGISPro computes and displays the fastest route, plus distance and ETA.
+6. Right-click (or press `Esc`) in Route mode to clear the current route.
+
+## Run
+
+From the project folder:
+
+```powershell
+python RoadGISPro.py
+```
+
+## Files
+
+- `RoadGISPro.py`: Main application.
+- `README.md`: Project overview.
+- `CONTRIBUTING.md`: Contribution standards.
+- `LICENSE`: MIT license.
 
 ## Contributing
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
-
-Key rule from the maintainer:
-
-1. **Do not use AI for contributing.**
-
-Additional project rules are also documented there (respectful collaboration, clear commits, tested changes, etc.).
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening issues or pull requests.
 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-
-That means you can use, modify, and distribute it freely, as long as you keep the copyright and license notice.
-
----
-
-If you want RoadGISPro to stay independent and community-driven, please follow the rules and help keep quality high.

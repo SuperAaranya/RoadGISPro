@@ -79,6 +79,7 @@ SURFACE_TYPES = ["asphalt", "concrete", "gravel", "dirt", "cobblestone", "paved"
 SNAP_PX      = 14
 NODE_RADIUS  = 4
 SMOOTH_STEPS = 16
+ROUTE_PICK_PX = 48
 
 MAP_BG      = "#1a2030"
 DARK_BG     = "#111520"
@@ -257,6 +258,7 @@ class App:
         self.route_start = None
         self.route_end = None
         self.route_time_hours = 0.0
+        self.route_distance_units = 0.0
         self._pan_origin    = None
         self._show_grid     = True
         self._show_nodes    = True
@@ -365,6 +367,7 @@ class App:
 
         for text, cmd, fg in [
             ("Fit [F]", self.zoom_fit, PANEL_FG),
+            ("Clear Route", self._clear_route_and_redraw, PANEL_FG),
             ("Delete [Del]", self.delete_selected, ACCENT2),
         ]:
             tk.Button(
@@ -678,6 +681,7 @@ class App:
         self._status_var = tk.StringVar(value="Ready  |  Draw mode")
         self._coords_var = tk.StringVar(value="X: 0.000   Y: 0.000")
         self._zoom_var   = tk.StringVar(value="1:1000")
+        self._route_var  = tk.StringVar(value="Route: none")
 
         tk.Label(sb, text=" RoadGIS ", bg="#1a2860", fg=ACCENT,
                  font=("Consolas", 8, "bold")).pack(side="left")
@@ -685,6 +689,9 @@ class App:
                  font=("Consolas", 8), anchor="w", padx=8).pack(side="left")
 
         tk.Label(sb, textvariable=self._zoom_var, bg="#0c1020", fg="#4a6090",
+                 font=("Consolas", 8), padx=10).pack(side="right")
+        tk.Frame(sb, bg=BORDER, width=1).pack(side="right", fill="y", pady=4)
+        tk.Label(sb, textvariable=self._route_var, bg="#0c1020", fg="#5a7090",
                  font=("Consolas", 8), padx=10).pack(side="right")
         tk.Frame(sb, bg=BORDER, width=1).pack(side="right", fill="y", pady=4)
         tk.Label(sb, textvariable=self._coords_var, bg="#0c1020", fg="#5a7090",
@@ -729,7 +736,7 @@ class App:
             ("<Control-V>", lambda e: self.paste_road()),
             ("<Delete>",    guard(self.delete_selected)),
             ("<BackSpace>", guard(self.delete_last_node)),
-            ("<Escape>",    guard(self.cancel_draw)),
+            ("<Escape>",    guard(self.escape_action)),
             ("<f>",         guard(self.zoom_fit)),
             ("<F>",         guard(self.zoom_fit)),
             ("<g>",         guard(self.toggle_grid)),
@@ -769,6 +776,13 @@ class App:
         else:
             self._set_status(f"{mode.capitalize()} mode active")
         self.redraw()
+
+    def escape_action(self):
+        if self.mode == "route":
+            self._clear_route_and_redraw()
+            self._set_status("Route cleared")
+            return
+        self.cancel_draw()
 
     def _update_mode_buttons(self):
         for m, btn in self._mode_buttons.items():
@@ -856,8 +870,7 @@ class App:
 
     def on_right_click(self, e):
         if self.mode == "route":
-            self._clear_route()
-            self.redraw()
+            self._clear_route_and_redraw()
             self._set_status("Route cleared")
             return
         if self.mode == "draw" and len(self.current) > 1:
@@ -1438,7 +1451,7 @@ class App:
 
     def _nearest_graph_node(self, p):
         if not self.graph:
-            return None
+            return None, None
         best = None
         best_d = float("inf")
         for node in self.graph.keys():
@@ -1446,7 +1459,7 @@ class App:
             if d < best_d:
                 best_d = d
                 best = node
-        return best
+        return best, best_d
 
     def _shortest_time_path(self, start, end):
         if start not in self.graph or end not in self.graph:
@@ -1486,25 +1499,54 @@ class App:
             return f"{h}h {m}m"
         return f"{m}m"
 
+    def _route_length_units(self, path):
+        total = 0.0
+        for i in range(len(path) - 1):
+            a = path[i]
+            b = path[i + 1]
+            total += math.hypot(b[0] - a[0], b[1] - a[1])
+        return total
+
+    def _update_route_status_label(self):
+        if len(self.route_path) > 1:
+            km = self.route_distance_units / 1000.0
+            self._route_var.set(f"Route: {km:.2f} km | {self._format_hours(self.route_time_hours)}")
+        elif self.route_start is not None:
+            self._route_var.set("Route: start set")
+        else:
+            self._route_var.set("Route: none")
+
     def _clear_route(self):
         self.route_path = []
         self.route_start = None
         self.route_end = None
         self.route_time_hours = 0.0
+        self.route_distance_units = 0.0
+        self._update_route_status_label()
+
+    def _clear_route_and_redraw(self):
+        self._clear_route()
+        self.redraw()
 
     def _route_click(self, p):
         if not self.graph:
             self._set_status("No road network available for routing")
             return
-        node = self._nearest_graph_node(p)
+        node, dist_to_node = self._nearest_graph_node(p)
         if node is None:
             self._set_status("No routable nodes found")
+            return
+        max_pick_dist = ROUTE_PICK_PX / max(self.scale, 0.001)
+        if dist_to_node is not None and dist_to_node > max_pick_dist:
+            self._set_status("Click closer to a road vertex to set route point")
             return
         if self.route_start is None or (self.route_start is not None and self.route_end is not None):
             self.route_start = node
             self.route_end = None
             self.route_path = []
             self.route_time_hours = 0.0
+            self.route_distance_units = 0.0
+            self._update_route_status_label()
             self._set_status("Start set  |  Click destination")
             self.redraw()
             return
@@ -1513,12 +1555,17 @@ class App:
         if not path:
             self.route_path = []
             self.route_time_hours = 0.0
+            self.route_distance_units = 0.0
+            self._update_route_status_label()
             self._set_status("No route found between selected points")
             self.redraw()
             return
         self.route_path = path
         self.route_time_hours = travel_h
-        self._set_status(f"Fastest route: {self._format_hours(travel_h)}")
+        self.route_distance_units = self._route_length_units(path)
+        self._update_route_status_label()
+        km = self.route_distance_units / 1000.0
+        self._set_status(f"Fastest route: {self._format_hours(travel_h)} over {km:.2f} km")
         self.redraw()
 
     def apply(self):

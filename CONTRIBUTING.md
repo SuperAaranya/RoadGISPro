@@ -1,53 +1,34 @@
-# Contributing to RoadGISPro
+﻿# Contributing to RoadGISPro
 
-Thanks for your interest in improving RoadGISPro.
+Thanks for helping improve RoadGISPro.
 
-This project is meant to stay free, ad-free, and community-driven.
+## Core Rules
 
-## Mandatory Rule
+1. Keep contributions relevant to GIS, road mapping, usability, stability, or docs.
+2. Be respectful and constructive in all discussions.
+3. Use clear commit messages that explain what changed and why.
+4. Test your changes before opening a pull request.
+5. Do not add ads, trackers, or paywall logic.
+6. Keep dependencies reasonable and justified.
+7. Update docs when behavior or workflows change.
+8. Preserve license and attribution notices.
 
-1. **DO NOT USE AI FOR CONTRIBUTING.**
-   - No AI-generated code.
-   - No AI-generated pull requests.
-   - No AI-generated issue spam.
+## Maintainer Policy
 
-## Additional Contribution Rules
-
-2. **Keep contributions relevant to RoadGISPro.**
-   - Focus on GIS, road mapping, usability, stability, and documentation.
-
-3. **Be respectful and constructive.**
-   - No harassment, insults, or hostile behavior.
-
-4. **Use clear commit messages.**
-   - Explain what changed and why.
-
-5. **Test your changes before submitting.**
-   - Do basic checks so your update does not break existing behavior.
-
-6. **Do not add ads, trackers, or paywall logic.**
-   - This project is intentionally no-ads and free.
-
-7. **Keep dependencies reasonable.**
-   - Avoid unnecessary heavy libraries.
-
-8. **Document non-trivial changes.**
-   - Update README or inline docs when needed.
-
-9. **Do not remove credit or license notices.**
-   - Preserve attribution and legal notices.
-
-10. **Maintainer decisions are final.**
-   - Contributions may be accepted, requested for changes, or declined.
+- The maintainer may accept, request changes, or decline contributions.
 
 ## Pull Request Checklist
 
-Before submitting, please verify:
-
-- [ ] I followed the **NO AI** rule.
-- [ ] My changes are relevant and focused.
+- [ ] My change is focused and relevant.
 - [ ] I tested the updated behavior.
-- [ ] I updated docs where needed.
-- [ ] I did not add ads, tracking, or paywall code.
+- [ ] I updated documentation if needed.
+- [ ] I avoided unrelated refactors.
+- [ ] I did not add ads/tracking/paywall logic.
 
-Thanks for helping keep RoadGISPro open and independent.
+## Suggested Validation
+
+Run these before submitting:
+
+```powershell
+python -m py_compile RoadGISPro.py
+```
