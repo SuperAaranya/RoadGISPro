@@ -25,8 +25,8 @@ def _derive_keystream(length: int) -> bytes:
     return bytes(stream[:length])
 
 
-def encode_rgis(roads: list) -> bytes:
-    payload      = json.dumps(roads, separators=(",", ":")).encode("utf-8")
+def encode_rgis(data) -> bytes:
+    payload      = json.dumps(data, separators=(",", ":")).encode("utf-8")
     compressed   = zlib.compress(payload, level=9)
     keystream    = _derive_keystream(len(compressed))
     encrypted    = bytes(b ^ k for b, k in zip(compressed, keystream))
@@ -36,7 +36,7 @@ def encode_rgis(roads: list) -> bytes:
     return encoded
 
 
-def decode_rgis(raw: bytes) -> list:
+def decode_rgis(raw: bytes):
     try:
         blob      = base64.b85decode(raw.strip())
     except Exception:
@@ -58,8 +58,12 @@ def decode_rgis(raw: bytes) -> list:
         raise ValueError("Checksum mismatch — file is corrupt or has been tampered with.")
     payload = zlib.decompress(compressed)
     data    = json.loads(payload.decode("utf-8"))
-    if not isinstance(data, list):
-        raise ValueError("Decoded data is not a feature list.")
+    if isinstance(data, list):
+        data = {"roads": data, "connectors": []}
+    if not isinstance(data, dict) or "roads" not in data:
+        raise ValueError("Decoded data is not a valid RoadGIS layer object.")
+    if "connectors" not in data or not isinstance(data["connectors"], list):
+        data["connectors"] = []
     return data
 
 
@@ -80,6 +84,8 @@ SNAP_PX      = 14
 NODE_RADIUS  = 4
 SMOOTH_STEPS = 16
 ROUTE_PICK_PX = 48
+CONNECT_PICK_PX = 20
+CONNECTOR_TRAVEL_HOURS = 0.002
 
 MAP_BG      = "#1a2030"
 DARK_BG     = "#111520"
@@ -254,7 +260,11 @@ class App:
         self.offy       = 0.0
         self.graph      = {}
         self.mode       = "draw"
+        self.connectors = []
+        self._pending_connector = None
         self.route_path = []
+        self.route_start_node = None
+        self.route_end_node = None
         self.route_start = None
         self.route_end = None
         self.route_time_hours = 0.0
@@ -351,7 +361,7 @@ class App:
 
         self._mode_buttons = {}
 
-        for text, mode, key in [("Draw", "draw", "D"), ("Select", "select", "S"), ("Pan", "pan", "P"), ("Route", "route", "R")]:
+        for text, mode, key in [("Draw", "draw", "D"), ("Select", "select", "S"), ("Pan", "pan", "P"), ("Route", "route", "R"), ("Connect", "connect", "K")]:
             b = tk.Button(
                 tb, text=f"{text} [{key}]",
                 command=lambda m=mode: self.set_mode(m),
@@ -644,6 +654,7 @@ class App:
             ("G",           "Toggle grid"),
             ("Esc",         "Cancel draw"),
             ("R",           "Route mode"),
+            ("K",           "Connector mode"),
             ("Del",         "Delete selected"),
         ]
         for key, desc in controls:
@@ -759,6 +770,8 @@ class App:
             ("<P>",         guard(lambda: self.set_mode("pan"))),
             ("<r>",         guard(lambda: self.set_mode("route"))),
             ("<R>",         guard(lambda: self.set_mode("route"))),
+            ("<k>",         guard(lambda: self.set_mode("connect"))),
+            ("<K>",         guard(lambda: self.set_mode("connect"))),
         ]
         for seq, handler in bindings:
             self.root.bind(seq, handler)
@@ -768,11 +781,15 @@ class App:
         self.current = []
         if mode != "route":
             self._clear_route()
-        cursors = {"draw": "crosshair", "select": "arrow", "pan": "fleur", "route": "tcross"}
+        if mode != "connect":
+            self._pending_connector = None
+        cursors = {"draw": "crosshair", "select": "arrow", "pan": "fleur", "route": "tcross", "connect": "crosshair"}
         self.canvas.config(cursor=cursors.get(mode, "arrow"))
         self._update_mode_buttons()
         if mode == "route":
             self._set_status("Route mode active  |  Click start and destination")
+        elif mode == "connect":
+            self._set_status("Connect mode active  |  Click two vertices on different/same levels")
         else:
             self._set_status(f"{mode.capitalize()} mode active")
         self.redraw()
@@ -781,6 +798,11 @@ class App:
         if self.mode == "route":
             self._clear_route_and_redraw()
             self._set_status("Route cleared")
+            return
+        if self.mode == "connect":
+            self._pending_connector = None
+            self.redraw()
+            self._set_status("Connector selection canceled")
             return
         self.cancel_draw()
 
@@ -816,6 +838,9 @@ class App:
         wx, wy = self.world(e.x, e.y)
         if self.mode == "route":
             self._route_click((wx, wy))
+            return
+        if self.mode == "connect":
+            self._connector_click((wx, wy))
             return
         if self.mode == "select":
             hit, idx = self._hit_test(wx, wy)
@@ -872,6 +897,11 @@ class App:
         if self.mode == "route":
             self._clear_route_and_redraw()
             self._set_status("Route cleared")
+            return
+        if self.mode == "connect":
+            self._pending_connector = None
+            self.redraw()
+            self._set_status("Connector selection canceled")
             return
         if self.mode == "draw" and len(self.current) > 1:
             self._push_undo()
@@ -947,7 +977,15 @@ class App:
                     self._push_undo()
                     self._drag_undo_pushed = True
                 wx, wy     = self.world(e.x, e.y)
-                road.geom[idx] = list(self.snap((wx, wy)))
+                old_pt = tuple(road.geom[idx])
+                new_pt = tuple(self.snap((wx, wy)))
+                road.geom[idx] = [new_pt[0], new_pt[1]]
+                level = int(road.bridge_level)
+                for conn in self.connectors:
+                    if tuple(conn["a"]) == (old_pt[0], old_pt[1], level):
+                        conn["a"] = [new_pt[0], new_pt[1], level]
+                    if tuple(conn["b"]) == (old_pt[0], old_pt[1], level):
+                        conn["b"] = [new_pt[0], new_pt[1], level]
                 self.dirty = True
                 self.build_graph()
                 self.redraw()
@@ -1199,6 +1237,22 @@ class App:
                     c.create_oval(sx - r_px, sy - r_px, sx + r_px, sy + r_px,
                                   fill=MAP_BG, outline=nc, width=1.5)
 
+        for conn in self.connectors:
+            ax, ay, al = conn["a"]
+            bx, by, bl = conn["b"]
+            x1, y1 = self.screen(ax, ay)
+            x2, y2 = self.screen(bx, by)
+            c.create_line(x1, y1, x2, y2, fill="#7de2d1", width=2, dash=(6, 4))
+            mx = (x1 + x2) / 2
+            my = (y1 + y2) / 2
+            c.create_text(mx, my - 8, text=f"L{al}<->L{bl}", fill="#9aeede", font=("Consolas", 7, "bold"))
+
+        if self._pending_connector is not None:
+            px, py, pl = self._pending_connector
+            sx, sy = self.screen(px, py)
+            c.create_oval(sx - 8, sy - 8, sx + 8, sy + 8, fill="#7de2d1", outline="white", width=1.5)
+            c.create_text(sx, sy - 12, text=f"L{pl}", fill="#9aeede", font=("Consolas", 7, "bold"))
+
         if len(self.route_path) > 1:
             flat = []
             for pt in self.route_path:
@@ -1358,7 +1412,10 @@ class App:
                       font=("Consolas", 8, "bold"), anchor="s")
 
     def _snapshot(self):
-        return copy.deepcopy([r.to_dict() for r in self.roads.values()])
+        return copy.deepcopy({
+            "roads": [r.to_dict() for r in self.roads.values()],
+            "connectors": self.connectors,
+        })
 
     def _push_undo(self):
         self._undo_stack.append(self._snapshot())
@@ -1368,11 +1425,14 @@ class App:
 
     def _restore_snapshot(self, snapshot):
         self.roads    = {}
+        self.connectors = []
+        payload = snapshot if isinstance(snapshot, dict) else {"roads": snapshot, "connectors": []}
         self.selected = None
         self.drag_info = None
-        for d in snapshot:
+        for d in payload.get("roads", []):
             r = Road.from_dict(d)
             self.roads[r.id] = r
+        self.connectors = copy.deepcopy(payload.get("connectors", []))
         self.build_graph()
         self._road_count_var.set(str(len(self.roads)))
         self._info_var.set("No feature selected")
@@ -1429,14 +1489,23 @@ class App:
         self.graph = {}
         for r in self.roads.values():
             for i in range(len(r.geom) - 1):
-                a = tuple(r.geom[i])
-                b = tuple(r.geom[i + 1])
+                a = (r.geom[i][0], r.geom[i][1], int(r.bridge_level))
+                b = (r.geom[i + 1][0], r.geom[i + 1][1], int(r.bridge_level))
                 seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
                 edge_h = self._segment_travel_hours(r, seg_len)
                 self.graph.setdefault(a, []).append((b, edge_h))
                 self.graph.setdefault(b, [])
                 if not r.oneway:
                     self.graph.setdefault(b, []).append((a, edge_h))
+        for conn in self.connectors:
+            try:
+                a = tuple(conn["a"])
+                b = tuple(conn["b"])
+            except Exception:
+                continue
+            if a in self.graph and b in self.graph:
+                self.graph[a].append((b, CONNECTOR_TRAVEL_HOURS))
+                self.graph[b].append((a, CONNECTOR_TRAVEL_HOURS))
         self._clear_route()
 
     def _segment_travel_hours(self, road, seg_len):
@@ -1518,6 +1587,8 @@ class App:
 
     def _clear_route(self):
         self.route_path = []
+        self.route_start_node = None
+        self.route_end_node = None
         self.route_start = None
         self.route_end = None
         self.route_time_hours = 0.0
@@ -1532,16 +1603,21 @@ class App:
         if not self.graph:
             self._set_status("No road network available for routing")
             return
-        node, dist_to_node = self._nearest_graph_node(p)
+        node, dist_to_node = self._nearest_road_vertex_with_level(p)
         if node is None:
             self._set_status("No routable nodes found")
+            return
+        if node not in self.graph:
+            self._set_status("Selected node is not part of routable graph")
             return
         max_pick_dist = ROUTE_PICK_PX / max(self.scale, 0.001)
         if dist_to_node is not None and dist_to_node > max_pick_dist:
             self._set_status("Click closer to a road vertex to set route point")
             return
         if self.route_start is None or (self.route_start is not None and self.route_end is not None):
-            self.route_start = node
+            self.route_start_node = node
+            self.route_start = (node[0], node[1])
+            self.route_end_node = None
             self.route_end = None
             self.route_path = []
             self.route_time_hours = 0.0
@@ -1550,8 +1626,10 @@ class App:
             self._set_status("Start set  |  Click destination")
             self.redraw()
             return
-        self.route_end = node
-        path, travel_h = self._shortest_time_path(self.route_start, self.route_end)
+        self.route_end_node = node
+        self.route_end = (node[0], node[1])
+        path_nodes, travel_h = self._shortest_time_path(self.route_start_node, self.route_end_node)
+        path = [(n[0], n[1]) for n in path_nodes] if path_nodes else None
         if not path:
             self.route_path = []
             self.route_time_hours = 0.0
@@ -1567,6 +1645,52 @@ class App:
         km = self.route_distance_units / 1000.0
         self._set_status(f"Fastest route: {self._format_hours(travel_h)} over {km:.2f} km")
         self.redraw()
+
+    def _nearest_road_vertex_with_level(self, p):
+        best = None
+        best_d = float("inf")
+        for r in self.roads.values():
+            level = int(r.bridge_level)
+            for vx, vy in r.geom:
+                d = math.hypot(vx - p[0], vy - p[1])
+                if d < best_d:
+                    best_d = d
+                    best = (vx, vy, level)
+        return best, best_d
+
+    def _connector_click(self, p):
+        if not self.roads:
+            self._set_status("No roads available for connectors")
+            return
+        node, dist_to_node = self._nearest_road_vertex_with_level(p)
+        if node is None:
+            self._set_status("No vertex found")
+            return
+        max_pick_dist = CONNECT_PICK_PX / max(self.scale, 0.001)
+        if dist_to_node is not None and dist_to_node > max_pick_dist:
+            self._set_status("Click closer to a road vertex for connector endpoint")
+            return
+        if self._pending_connector is None:
+            self._pending_connector = node
+            self._set_status(f"Connector start set at L{node[2]}  |  Click second vertex")
+            self.redraw()
+            return
+        a = tuple(self._pending_connector)
+        b = tuple(node)
+        if a == b:
+            self._set_status("Connector endpoints must be different")
+            return
+        if any((tuple(c["a"]) == a and tuple(c["b"]) == b) or (tuple(c["a"]) == b and tuple(c["b"]) == a) for c in self.connectors):
+            self._pending_connector = None
+            self._set_status("Connector already exists")
+            self.redraw()
+            return
+        self._push_undo()
+        self.connectors.append({"a": [a[0], a[1], a[2]], "b": [b[0], b[1], b[2]]})
+        self._pending_connector = None
+        self.build_graph()
+        self.redraw()
+        self._set_status(f"Connector added L{a[2]} <-> L{b[2]}")
 
     def apply(self):
         if not self.selected:
@@ -1662,6 +1786,8 @@ class App:
         if messagebox.askyesno("Clear Layer", "Remove all features from this layer?"):
             self._push_undo()
             self.roads     = {}
+            self.connectors = []
+            self._pending_connector = None
             self.current   = []
             self.selected  = None
             self.graph     = {}
@@ -1690,7 +1816,10 @@ class App:
 
     def _write_file(self, path):
         try:
-            data    = [r.to_dict() for r in self.roads.values()]
+            data = {
+                "roads": [r.to_dict() for r in self.roads.values()],
+                "connectors": self.connectors,
+            }
             encoded = encode_rgis(data)
             with open(path, "wb") as f:
                 f.write(encoded)
@@ -1712,6 +1841,7 @@ class App:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({
                     "roads":         [r.to_dict() for r in self.roads.values()],
+                    "connectors":    self.connectors,
                     "feature_count": len(self.roads),
                     "graph_nodes":   len(self.graph),
                 }, f, indent=2)
@@ -1735,20 +1865,23 @@ class App:
             with open(path, "rb") as f:
                 raw = f.read()
             if path.endswith(".json"):
-                data = json.loads(raw.decode("utf-8"))
-                if not isinstance(data, list):
-                    if isinstance(data, dict) and "roads" in data:
-                        data = data["roads"]
-                    else:
-                        raise ValueError("Expected a JSON array or object with 'roads' key.")
+                payload = json.loads(raw.decode("utf-8"))
+                if isinstance(payload, list):
+                    payload = {"roads": payload, "connectors": []}
+                if not isinstance(payload, dict) or "roads" not in payload:
+                    raise ValueError("Expected a JSON array or object with 'roads' key.")
+                if "connectors" not in payload or not isinstance(payload["connectors"], list):
+                    payload["connectors"] = []
             else:
-                data = decode_rgis(raw)
+                payload = decode_rgis(raw)
             self.roads    = {}
+            self.connectors = copy.deepcopy(payload.get("connectors", []))
+            self._pending_connector = None
             self.current  = []
             self.selected = None
             self._undo_stack.clear()
             self._redo_stack.clear()
-            for d in data:
+            for d in payload["roads"]:
                 r = Road.from_dict(d)
                 self.roads[r.id] = r
             self.file  = path
@@ -1764,6 +1897,8 @@ class App:
     def new(self):
         self._ask_save()
         self.roads     = {}
+        self.connectors = []
+        self._pending_connector = None
         self.current   = []
         self.selected  = None
         self.file      = None
