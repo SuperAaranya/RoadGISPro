@@ -1486,6 +1486,7 @@ class App:
         self._set_status(f"Pasted '{r.name}'")
 
     def build_graph(self):
+        self._prune_orphan_connectors()
         self.graph = {}
         for r in self.roads.values():
             for i in range(len(r.geom) - 1):
@@ -1517,6 +1518,29 @@ class App:
         effective_speed = max(5.0, base_speed * lane_factor * surface_factor * tunnel_factor * lit_factor)
         distance_km = max(0.001, seg_len / 1000.0)
         return distance_km / effective_speed
+
+    def _valid_level_nodes(self):
+        nodes = set()
+        for r in self.roads.values():
+            level = int(r.bridge_level)
+            for vx, vy in r.geom:
+                nodes.add((vx, vy, level))
+        return nodes
+
+    def _prune_orphan_connectors(self):
+        valid = self._valid_level_nodes()
+        before = len(self.connectors)
+        kept = []
+        for conn in self.connectors:
+            try:
+                a = tuple(conn["a"])
+                b = tuple(conn["b"])
+            except Exception:
+                continue
+            if a in valid and b in valid and a != b:
+                kept.append(conn)
+        self.connectors = kept
+        return before - len(kept)
 
     def _nearest_graph_node(self, p):
         if not self.graph:
@@ -1697,6 +1721,8 @@ class App:
             return
         self._push_undo()
         r = self.selected
+        old_level = int(r.bridge_level)
+        old_pts = {tuple(pt) for pt in r.geom}
         r.name    = self._name_var.get().strip() or "Unnamed"
         r.ref     = self._ref_var.get().strip()
         r.rtype   = self._type_var.get()
@@ -1720,6 +1746,15 @@ class App:
             r.max_weight = float(self._max_weight_var.get())
         except ValueError:
             pass
+        new_level = int(r.bridge_level)
+        if new_level != old_level and old_pts:
+            for conn in self.connectors:
+                a = tuple(conn.get("a", []))
+                b = tuple(conn.get("b", []))
+                if len(a) == 3 and (a[0], a[1]) in old_pts and int(a[2]) == old_level:
+                    conn["a"] = [a[0], a[1], new_level]
+                if len(b) == 3 and (b[0], b[1]) in old_pts and int(b[2]) == old_level:
+                    conn["b"] = [b[0], b[1], new_level]
         self.dirty = True
         self.build_graph()
         self._update_info(r)
@@ -1772,6 +1807,21 @@ class App:
         if self.selected and self.selected.id in self.roads:
             self._push_undo()
             name = self.selected.name
+            level = int(self.selected.bridge_level)
+            pts = {tuple(pt) for pt in self.selected.geom}
+            if pts:
+                kept = []
+                for conn in self.connectors:
+                    try:
+                        a = tuple(conn["a"])
+                        b = tuple(conn["b"])
+                    except Exception:
+                        continue
+                    a_hits = len(a) == 3 and (a[0], a[1]) in pts and int(a[2]) == level
+                    b_hits = len(b) == 3 and (b[0], b[1]) in pts and int(b[2]) == level
+                    if not (a_hits or b_hits):
+                        kept.append(conn)
+                self.connectors = kept
             del self.roads[self.selected.id]
             self.selected  = None
             self.drag_info = None
