@@ -8,6 +8,7 @@ import hashlib
 import struct
 import zlib
 import copy
+import heapq
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -252,6 +253,10 @@ class App:
         self.offy       = 0.0
         self.graph      = {}
         self.mode       = "draw"
+        self.route_path = []
+        self.route_start = None
+        self.route_end = None
+        self.route_time_hours = 0.0
         self._pan_origin    = None
         self._show_grid     = True
         self._show_nodes    = True
@@ -344,7 +349,7 @@ class App:
 
         self._mode_buttons = {}
 
-        for text, mode, key in [("Draw", "draw", "D"), ("Select", "select", "S"), ("Pan", "pan", "P")]:
+        for text, mode, key in [("Draw", "draw", "D"), ("Select", "select", "S"), ("Pan", "pan", "P"), ("Route", "route", "R")]:
             b = tk.Button(
                 tb, text=f"{text} [{key}]",
                 command=lambda m=mode: self.set_mode(m),
@@ -635,6 +640,7 @@ class App:
             ("N",           "Toggle nodes"),
             ("G",           "Toggle grid"),
             ("Esc",         "Cancel draw"),
+            ("R",           "Route mode"),
             ("Del",         "Delete selected"),
         ]
         for key, desc in controls:
@@ -744,6 +750,8 @@ class App:
             ("<S>",         guard(lambda: self.set_mode("select"))),
             ("<p>",         guard(lambda: self.set_mode("pan"))),
             ("<P>",         guard(lambda: self.set_mode("pan"))),
+            ("<r>",         guard(lambda: self.set_mode("route"))),
+            ("<R>",         guard(lambda: self.set_mode("route"))),
         ]
         for seq, handler in bindings:
             self.root.bind(seq, handler)
@@ -752,11 +760,14 @@ class App:
         self.mode    = mode
         self.current = []
         if mode != "route":
-            self.route_path = []
-        cursors = {"draw": "crosshair", "select": "arrow", "pan": "fleur"}
+            self._clear_route()
+        cursors = {"draw": "crosshair", "select": "arrow", "pan": "fleur", "route": "tcross"}
         self.canvas.config(cursor=cursors.get(mode, "arrow"))
         self._update_mode_buttons()
-        self._set_status(f"{mode.capitalize()} mode active")
+        if mode == "route":
+            self._set_status("Route mode active  |  Click start and destination")
+        else:
+            self._set_status(f"{mode.capitalize()} mode active")
         self.redraw()
 
     def _update_mode_buttons(self):
@@ -789,6 +800,9 @@ class App:
             self.pan_start(e)
             return
         wx, wy = self.world(e.x, e.y)
+        if self.mode == "route":
+            self._route_click((wx, wy))
+            return
         if self.mode == "select":
             hit, idx = self._hit_test(wx, wy)
             if hit:
@@ -841,6 +855,11 @@ class App:
         return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
     def on_right_click(self, e):
+        if self.mode == "route":
+            self._clear_route()
+            self.redraw()
+            self._set_status("Route cleared")
+            return
         if self.mode == "draw" and len(self.current) > 1:
             self._push_undo()
             name  = self._name_var.get().strip() or "Unnamed"
@@ -1167,6 +1186,21 @@ class App:
                     c.create_oval(sx - r_px, sy - r_px, sx + r_px, sy + r_px,
                                   fill=MAP_BG, outline=nc, width=1.5)
 
+        if len(self.route_path) > 1:
+            flat = []
+            for pt in self.route_path:
+                sx, sy = self.screen(*pt)
+                flat.extend([sx, sy])
+            c.create_line(*flat, width=7, fill="#ffffff", capstyle="round", joinstyle="round")
+            c.create_line(*flat, width=4, fill=ACCENT2, capstyle="round", joinstyle="round")
+
+        if self.route_start is not None:
+            sx, sy = self.screen(*self.route_start)
+            c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, fill="#19c37d", outline="white", width=1.5)
+        if self.route_end is not None:
+            sx, sy = self.screen(*self.route_end)
+            c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, fill="#f0b90b", outline="white", width=1.5)
+
         if self._show_names:
             for r in road_order:
                 name = r.name
@@ -1384,10 +1418,108 @@ class App:
             for i in range(len(r.geom) - 1):
                 a = tuple(r.geom[i])
                 b = tuple(r.geom[i + 1])
-                self.graph.setdefault(a, []).append(b)
+                seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
+                edge_h = self._segment_travel_hours(r, seg_len)
+                self.graph.setdefault(a, []).append((b, edge_h))
                 self.graph.setdefault(b, [])
                 if not r.oneway:
-                    self.graph.setdefault(b, []).append(a)
+                    self.graph.setdefault(b, []).append((a, edge_h))
+        self._clear_route()
+
+    def _segment_travel_hours(self, road, seg_len):
+        base_speed = max(5.0, float(road.speed))
+        lane_factor = 1.0 + min(0.2, max(0, road.lanes - 1) * 0.05)
+        surface_factor = {"asphalt": 1.0, "gravel": 0.78, "dirt": 0.62}.get(road.surface, 0.9)
+        tunnel_factor = 0.92 if road.tunnel else 1.0
+        lit_factor = 1.03 if road.lit else 1.0
+        effective_speed = max(5.0, base_speed * lane_factor * surface_factor * tunnel_factor * lit_factor)
+        distance_km = max(0.001, seg_len / 1000.0)
+        return distance_km / effective_speed
+
+    def _nearest_graph_node(self, p):
+        if not self.graph:
+            return None
+        best = None
+        best_d = float("inf")
+        for node in self.graph.keys():
+            d = math.hypot(node[0] - p[0], node[1] - p[1])
+            if d < best_d:
+                best_d = d
+                best = node
+        return best
+
+    def _shortest_time_path(self, start, end):
+        if start not in self.graph or end not in self.graph:
+            return None, None
+        dist = {start: 0.0}
+        prev = {}
+        pq = [(0.0, start)]
+        seen = set()
+        while pq:
+            curr_d, node = heapq.heappop(pq)
+            if node in seen:
+                continue
+            seen.add(node)
+            if node == end:
+                break
+            for nxt, w in self.graph.get(node, []):
+                nd = curr_d + w
+                if nd < dist.get(nxt, float("inf")):
+                    dist[nxt] = nd
+                    prev[nxt] = node
+                    heapq.heappush(pq, (nd, nxt))
+        if end not in dist:
+            return None, None
+        path = [end]
+        cur = end
+        while cur != start:
+            cur = prev[cur]
+            path.append(cur)
+        path.reverse()
+        return path, dist[end]
+
+    def _format_hours(self, hours):
+        total_mins = max(0, int(round(hours * 60)))
+        h = total_mins // 60
+        m = total_mins % 60
+        if h:
+            return f"{h}h {m}m"
+        return f"{m}m"
+
+    def _clear_route(self):
+        self.route_path = []
+        self.route_start = None
+        self.route_end = None
+        self.route_time_hours = 0.0
+
+    def _route_click(self, p):
+        if not self.graph:
+            self._set_status("No road network available for routing")
+            return
+        node = self._nearest_graph_node(p)
+        if node is None:
+            self._set_status("No routable nodes found")
+            return
+        if self.route_start is None or (self.route_start is not None and self.route_end is not None):
+            self.route_start = node
+            self.route_end = None
+            self.route_path = []
+            self.route_time_hours = 0.0
+            self._set_status("Start set  |  Click destination")
+            self.redraw()
+            return
+        self.route_end = node
+        path, travel_h = self._shortest_time_path(self.route_start, self.route_end)
+        if not path:
+            self.route_path = []
+            self.route_time_hours = 0.0
+            self._set_status("No route found between selected points")
+            self.redraw()
+            return
+        self.route_path = path
+        self.route_time_hours = travel_h
+        self._set_status(f"Fastest route: {self._format_hours(travel_h)}")
+        self.redraw()
 
     def apply(self):
         if not self.selected:
@@ -1486,6 +1618,7 @@ class App:
             self.current   = []
             self.selected  = None
             self.graph     = {}
+            self._clear_route()
             self.dirty     = True
             self._road_count_var.set("0")
             self._info_var.set("No feature selected")
@@ -1589,6 +1722,7 @@ class App:
         self.file      = None
         self.dirty     = False
         self.graph     = {}
+        self._clear_route()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._clipboard = None
