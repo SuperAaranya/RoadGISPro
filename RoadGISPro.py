@@ -167,6 +167,20 @@ def label_positions(geom, min_spacing_world=150):
     return results
 
 
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off", ""):
+            return False
+    return bool(value)
+
+
 class Road:
     def __init__(self, name, rtype, speed, lanes, oneway, geom, rid=None,
                  ref="", bridge_level=0, tunnel=False, surface="asphalt",
@@ -213,13 +227,13 @@ class Road:
     @staticmethod
     def from_dict(d):
         return Road(
-            d["name"], d["rtype"], d["speed"], d["lanes"], d["oneway"], d["geom"], d["id"],
+            d["name"], d["rtype"], d["speed"], d["lanes"], as_bool(d["oneway"]), d["geom"], d["id"],
             ref=d.get("ref", ""),
             bridge_level=d.get("bridge_level", 0),
-            tunnel=d.get("tunnel", False),
+            tunnel=as_bool(d.get("tunnel", False)),
             surface=d.get("surface", "asphalt"),
             max_weight=d.get("max_weight", 0.0),
-            lit=d.get("lit", False),
+            lit=as_bool(d.get("lit", False)),
         )
 
 
@@ -737,6 +751,8 @@ class App:
     def set_mode(self, mode):
         self.mode    = mode
         self.current = []
+        if mode != "route":
+            self.route_path = []
         cursors = {"draw": "crosshair", "select": "arrow", "pan": "fleur"}
         self.canvas.config(cursor=cursors.get(mode, "arrow"))
         self._update_mode_buttons()
@@ -1369,6 +1385,7 @@ class App:
                 a = tuple(r.geom[i])
                 b = tuple(r.geom[i + 1])
                 self.graph.setdefault(a, []).append(b)
+                self.graph.setdefault(b, [])
                 if not r.oneway:
                     self.graph.setdefault(b, []).append(a)
 
