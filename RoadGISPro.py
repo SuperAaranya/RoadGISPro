@@ -3,6 +3,7 @@ from tkinter import filedialog, messagebox, ttk
 import json
 import uuid
 import math
+import os
 import base64
 import hashlib
 import struct
@@ -14,6 +15,7 @@ FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
 FILE_EXT     = ".rgis"
 FILE_KEY     = b"RoadGISPro\x7f\x3a\x91\xb4\x2d\xe0\x55\xc8"
+APP_TITLE    = "RoadGIS Pro"
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -38,26 +40,32 @@ def encode_rgis(data) -> bytes:
 
 def decode_rgis(raw: bytes):
     try:
-        blob      = base64.b85decode(raw.strip())
-    except Exception:
-        raise ValueError("Not a valid .rgis file (base85 decode failed).")
+        blob = base64.b85decode(raw.strip())
+    except Exception as ex:
+        raise ValueError("Not a valid .rgis file (base85 decode failed).") from ex
     if len(blob) < 13:
         raise ValueError("File is too short to be a valid .rgis file.")
     magic = blob[:4]
     if magic != FILE_MAGIC:
-        raise ValueError(f"Bad magic bytes — expected RGIS, got {magic!r}.")
+        raise ValueError(f"Bad magic bytes - expected RGIS, got {magic!r}.")
     version, payload_len, checksum = struct.unpack(">BII", blob[4:13])
     if version != FILE_VERSION:
         raise ValueError(f"Unsupported file version {version}.")
     encrypted = blob[13:]
     if len(encrypted) != payload_len:
-        raise ValueError("Payload length mismatch — file may be truncated or corrupt.")
-    keystream  = _derive_keystream(len(encrypted))
+        raise ValueError("Payload length mismatch - file may be truncated or corrupt.")
+    keystream = _derive_keystream(len(encrypted))
     compressed = bytes(b ^ k for b, k in zip(encrypted, keystream))
     if (zlib.crc32(compressed) & 0xFFFFFFFF) != checksum:
-        raise ValueError("Checksum mismatch — file is corrupt or has been tampered with.")
-    payload = zlib.decompress(compressed)
-    data    = json.loads(payload.decode("utf-8"))
+        raise ValueError("Checksum mismatch - file is corrupt or has been tampered with.")
+    try:
+        payload = zlib.decompress(compressed)
+    except zlib.error as ex:
+        raise ValueError("Compressed payload is invalid.") from ex
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as ex:
+        raise ValueError("Decoded payload is not valid UTF-8 JSON.") from ex
     if isinstance(data, list):
         data = {"roads": data, "connectors": []}
     if not isinstance(data, dict) or "roads" not in data:
@@ -281,7 +289,7 @@ class App:
         self._redo_stack    = []
         self._clipboard     = None
 
-        root.title("RoadGIS Pro")
+        root.title(APP_TITLE)
         root.configure(bg=DARK_BG)
         root.geometry("1340x820")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -937,7 +945,7 @@ class App:
             self.roads[r.id] = r
             self.build_graph()
             self._road_count_var.set(str(len(self.roads)))
-            self._set_status(f"Feature '{name}' committed  —  {len(self.roads)} total")
+            self._set_status(f"Feature '{name}' committed  -  {len(self.roads)} total")
         self.current = []
         self.redraw()
 
@@ -1093,7 +1101,7 @@ class App:
         if self.current:
             self.current.pop()
             self._set_status(
-                f"Removed vertex  —  {len(self.current)} remaining"
+                f"Removed vertex  -  {len(self.current)} remaining"
             )
             self.redraw()
 
@@ -1432,7 +1440,7 @@ class App:
         for d in payload.get("roads", []):
             r = Road.from_dict(d)
             self.roads[r.id] = r
-        self.connectors = copy.deepcopy(payload.get("connectors", []))
+        self.connectors = self._normalize_connectors(payload.get("connectors", []))
         self.build_graph()
         self._road_count_var.set(str(len(self.roads)))
         self._info_var.set("No feature selected")
@@ -1446,7 +1454,7 @@ class App:
         self._redo_stack.append(self._snapshot())
         snapshot = self._undo_stack.pop()
         self._restore_snapshot(snapshot)
-        self._set_status(f"Undo  —  {len(self._undo_stack)} steps remain")
+        self._set_status(f"Undo  -  {len(self._undo_stack)} steps remain")
 
     def redo(self):
         if not self._redo_stack:
@@ -1455,7 +1463,7 @@ class App:
         self._undo_stack.append(self._snapshot())
         snapshot = self._redo_stack.pop()
         self._restore_snapshot(snapshot)
-        self._set_status(f"Redo  —  {len(self._redo_stack)} steps remain")
+        self._set_status(f"Redo  -  {len(self._redo_stack)} steps remain")
 
     def copy_selected(self):
         if not self.selected:
@@ -1526,6 +1534,26 @@ class App:
             for vx, vy in r.geom:
                 nodes.add((vx, vy, level))
         return nodes
+
+    def _coerce_level_node(self, node):
+        if not isinstance(node, (list, tuple)) or len(node) != 3:
+            return None
+        try:
+            return [float(node[0]), float(node[1]), int(node[2])]
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_connectors(self, connectors):
+        normalized = []
+        for conn in connectors or []:
+            if not isinstance(conn, dict):
+                continue
+            a = self._coerce_level_node(conn.get("a"))
+            b = self._coerce_level_node(conn.get("b"))
+            if not a or not b or a == b:
+                continue
+            normalized.append({"a": a, "b": b})
+        return normalized
 
     def _prune_orphan_connectors(self):
         valid = self._valid_level_nodes()
@@ -1788,7 +1816,7 @@ class App:
             flags.append(f"bridge L{r.bridge_level}")
         flags_str  = "  ".join(flags) if flags else "none"
         weight_str = f"{r.max_weight}t" if r.max_weight else "unlimited"
-        ref_str    = r.ref if r.ref else "—"
+        ref_str    = r.ref if r.ref else "-"
         self._info_var.set(
             f"FID:     {r.id[:10]}...\n"
             f"Ref:     {ref_str}\n"
@@ -1830,7 +1858,7 @@ class App:
             self._road_count_var.set(str(len(self.roads)))
             self._info_var.set("No feature selected")
             self.redraw()
-            self._set_status(f"Deleted '{name}'  —  {len(self.roads)} remain")
+            self._set_status(f"Deleted '{name}'  -  {len(self.roads)} remain")
 
     def clear_canvas(self):
         if messagebox.askyesno("Clear Layer", "Remove all features from this layer?"):
@@ -1865,19 +1893,27 @@ class App:
             self._write_file(path)
 
     def _write_file(self, path):
+        tmp_path = f"{path}.tmp"
         try:
             data = {
                 "roads": [r.to_dict() for r in self.roads.values()],
                 "connectors": self.connectors,
             }
             encoded = encode_rgis(data)
-            with open(path, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 f.write(encoded)
+            os.replace(tmp_path, path)
             self.dirty = False
             self._set_status(f"Saved  {path}")
-            self.root.title(f"RoadGIS Pro  —  {path}")
+            self.root.title(f"{APP_TITLE}  -  {path}")
         except OSError as ex:
             messagebox.showerror("Save Error", str(ex))
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def export_json(self):
         path = filedialog.asksaveasfilename(
@@ -1914,7 +1950,7 @@ class App:
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            if path.endswith(".json"):
+            if os.path.splitext(path)[1].lower() == ".json":
                 payload = json.loads(raw.decode("utf-8"))
                 if isinstance(payload, list):
                     payload = {"roads": payload, "connectors": []}
@@ -1925,7 +1961,7 @@ class App:
             else:
                 payload = decode_rgis(raw)
             self.roads    = {}
-            self.connectors = copy.deepcopy(payload.get("connectors", []))
+            self.connectors = self._normalize_connectors(payload.get("connectors", []))
             self._pending_connector = None
             self.current  = []
             self.selected = None
@@ -1938,7 +1974,7 @@ class App:
             self.dirty = False
             self.build_graph()
             self._road_count_var.set(str(len(self.roads)))
-            self.root.title(f"RoadGIS Pro  —  {path}")
+            self.root.title(f"{APP_TITLE}  -  {path}")
             self._set_status(f"Loaded {len(self.roads)} features from {path}")
             self.zoom_fit()
         except (OSError, ValueError, KeyError, struct.error) as ex:
@@ -1960,7 +1996,7 @@ class App:
         self._clipboard = None
         self._road_count_var.set("0")
         self._info_var.set("No feature selected")
-        self.root.title("RoadGIS Pro")
+        self.root.title(APP_TITLE)
         self.redraw()
         self._set_status("New layer")
 
@@ -1982,3 +2018,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     App(root)
     root.mainloop()
+
+
