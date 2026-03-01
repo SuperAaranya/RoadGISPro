@@ -1,4 +1,4 @@
-﻿# RoadGISPro
+# RoadGISPro
 
 RoadGISPro is a desktop GIS tool for creating and editing road networks, then running fastest-time routing on those roads.
 
