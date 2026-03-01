@@ -11,12 +11,22 @@ import zlib
 import copy
 import heapq
 import time
+import shutil
+import subprocess
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
 FILE_EXT     = ".rgis"
 FILE_KEY     = b"RoadGISPro\x7f\x3a\x91\xb4\x2d\xe0\x55\xc8"
 APP_TITLE    = "RoadGIS Pro"
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+POLYGLOT_DIR = os.path.join(BASE_DIR, "polyglot")
+RUST_ROUTER_MANIFEST = os.path.join(POLYGLOT_DIR, "rust_router", "Cargo.toml")
+RUST_ROUTER_BIN = os.path.join(
+    POLYGLOT_DIR, "rust_router", "target", "release",
+    "rust_router.exe" if os.name == "nt" else "rust_router",
+)
+JS_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "js", "metrics.js")
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -1657,6 +1667,57 @@ class App:
         path.reverse()
         return path, dist[end]
 
+    def _run_json_process(self, cmd, payload):
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            return json.loads(proc.stdout)
+        except Exception:
+            return None
+
+    def _shortest_time_path_polyglot(self, start, end):
+        if start not in self.graph or end not in self.graph:
+            return None, None
+        adjacency = []
+        for node, edges in self.graph.items():
+            adjacency.append({
+                "node": [node[0], node[1], int(node[2])],
+                "edges": [{"to": [n[0], n[1], int(n[2])], "weight": float(w)} for n, w in edges],
+            })
+        payload = {
+            "start": [start[0], start[1], int(start[2])],
+            "end": [end[0], end[1], int(end[2])],
+            "graph": adjacency,
+        }
+        cmd = None
+        if os.path.exists(RUST_ROUTER_BIN):
+            cmd = [RUST_ROUTER_BIN]
+        elif os.path.exists(RUST_ROUTER_MANIFEST) and shutil.which("cargo"):
+            cmd = ["cargo", "run", "--quiet", "--release", "--manifest-path", RUST_ROUTER_MANIFEST]
+        if not cmd:
+            return None, None
+        out = self._run_json_process(cmd, payload)
+        if not isinstance(out, dict):
+            return None, None
+        raw_path = out.get("path")
+        travel_h = out.get("travel_hours")
+        if not isinstance(raw_path, list) or not isinstance(travel_h, (int, float)):
+            return None, None
+        parsed = []
+        for n in raw_path:
+            if not isinstance(n, (list, tuple)) or len(n) != 3:
+                return None, None
+            try:
+                parsed.append((float(n[0]), float(n[1]), int(n[2])))
+            except (TypeError, ValueError):
+                return None, None
+        return parsed, float(travel_h)
+
     def _format_hours(self, hours):
         total_mins = max(0, int(round(hours * 60)))
         h = total_mins // 60
@@ -1725,7 +1786,9 @@ class App:
             return
         self.route_end_node = node
         self.route_end = (node[0], node[1])
-        path_nodes, travel_h = self._shortest_time_path(self.route_start_node, self.route_end_node)
+        path_nodes, travel_h = self._shortest_time_path_polyglot(self.route_start_node, self.route_end_node)
+        if not path_nodes:
+            path_nodes, travel_h = self._shortest_time_path(self.route_start_node, self.route_end_node)
         path = [(n[0], n[1]) for n in path_nodes] if path_nodes else None
         if not path:
             self.route_path = []
@@ -2228,16 +2291,57 @@ class App:
         if not path:
             return
         try:
+            payload = {
+                "roads": [r.to_dict() for r in self.roads.values()],
+                "connectors": self.connectors,
+            }
+            metrics = self._compute_metrics_polyglot(payload)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({
-                    "roads":         [r.to_dict() for r in self.roads.values()],
-                    "connectors":    self.connectors,
+                    "roads":         payload["roads"],
+                    "connectors":    payload["connectors"],
                     "feature_count": len(self.roads),
                     "graph_nodes":   len(self.graph),
+                    "metrics":       metrics,
                 }, f, indent=2)
             self._set_status(f"Exported to {path}")
         except OSError as ex:
             messagebox.showerror("Export Error", str(ex))
+
+    def _compute_metrics_fallback(self, payload):
+        road_count = 0
+        total_len = 0.0
+        total_speed = 0.0
+        total_lanes = 0
+        for r in payload.get("roads", []):
+            geom = r.get("geom", [])
+            if len(geom) < 2:
+                continue
+            road_count += 1
+            total_speed += float(r.get("speed", 0.0) or 0.0)
+            total_lanes += int(r.get("lanes", 0) or 0)
+            for i in range(len(geom) - 1):
+                ax, ay = geom[i]
+                bx, by = geom[i + 1]
+                total_len += math.hypot(float(bx) - float(ax), float(by) - float(ay))
+        avg_speed = (total_speed / road_count) if road_count else 0.0
+        avg_lanes = (total_lanes / road_count) if road_count else 0.0
+        return {
+            "engine": "python-fallback",
+            "road_count": road_count,
+            "connector_count": len(payload.get("connectors", [])),
+            "total_length_km": total_len / 1000.0,
+            "average_speed_limit": avg_speed,
+            "average_lanes": avg_lanes,
+        }
+
+    def _compute_metrics_polyglot(self, payload):
+        if os.path.exists(JS_METRICS_SCRIPT) and shutil.which("node"):
+            out = self._run_json_process(["node", JS_METRICS_SCRIPT], payload)
+            if isinstance(out, dict):
+                out.setdefault("engine", "javascript")
+                return out
+        return self._compute_metrics_fallback(payload)
 
     def load(self):
         if not self._ask_save():
