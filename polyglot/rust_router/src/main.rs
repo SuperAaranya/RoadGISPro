@@ -58,8 +58,8 @@ fn node_to_arr(node: &Node) -> [f64; 3] {
     [node.0[0], node.0[1], node.0[2]]
 }
 
-fn node_key(node: &Node) -> String {
-    format!("{:.9}|{:.9}|{:.0}", node.0[0], node.0[1], node.0[2])
+fn node_key(node: &Node) -> (u64, u64, u64) {
+    (node.0[0].to_bits(), node.0[1].to_bits(), node.0[2].to_bits())
 }
 
 fn main() {
@@ -77,7 +77,7 @@ fn run() -> Result<(), String> {
     let req: Request =
         serde_json::from_str(&input).map_err(|e| format!("request parse failed: {e}"))?;
 
-    let mut index_of: HashMap<String, usize> = HashMap::new();
+    let mut index_of: HashMap<(u64, u64, u64), usize> = HashMap::new();
     let mut nodes: Vec<Node> = Vec::new();
     for entry in &req.graph {
         let k = node_key(&entry.node);

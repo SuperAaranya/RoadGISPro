@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 
 function segmentLength(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length < 2 || b.length < 2) {
+    return 0;
+  }
   const dx = Number(b[0]) - Number(a[0]);
   const dy = Number(b[1]) - Number(a[1]);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+    return 0;
+  }
   return Math.hypot(dx, dy);
 }
 
@@ -16,12 +22,15 @@ function computeMetrics(payload) {
   let onewayCount = 0;
 
   for (const road of roads) {
+    if (!road || typeof road !== "object") continue;
     const geom = Array.isArray(road.geom) ? road.geom : [];
     for (let i = 0; i < geom.length - 1; i += 1) {
       totalLen += segmentLength(geom[i], geom[i + 1]);
     }
-    totalSpeed += Number(road.speed || 0);
-    totalLanes += Number(road.lanes || 0);
+    const speed = Number(road.speed || 0);
+    const lanes = Number(road.lanes || 0);
+    totalSpeed += Number.isFinite(speed) ? speed : 0;
+    totalLanes += Number.isFinite(lanes) ? lanes : 0;
     if (road.oneway) onewayCount += 1;
   }
 
@@ -43,7 +52,7 @@ async function main() {
     chunks.push(chunk);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
-  const payload = JSON.parse(raw);
+  const payload = raw.trim() ? JSON.parse(raw) : {};
   const result = computeMetrics(payload);
   process.stdout.write(JSON.stringify(result));
 }

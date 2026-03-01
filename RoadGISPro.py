@@ -260,13 +260,62 @@ class Road:
 
     @staticmethod
     def from_dict(d):
+        if not isinstance(d, dict):
+            raise ValueError("Road feature must be an object.")
+        rid = d.get("id")
+        if not isinstance(rid, str) or not rid.strip():
+            rid = str(uuid.uuid4())
+        name = d.get("name", "")
+        if not isinstance(name, str):
+            name = str(name)
+        name = name.strip() or "Unnamed"
+        rtype = d.get("rtype", "unclassified")
+        if rtype not in ROAD_STYLES:
+            rtype = "unclassified"
+        try:
+            speed = int(float(d.get("speed", 50)))
+        except (TypeError, ValueError):
+            speed = 50
+        speed = max(5, min(300, speed))
+        try:
+            lanes = int(float(d.get("lanes", 1)))
+        except (TypeError, ValueError):
+            lanes = 1
+        lanes = max(1, min(12, lanes))
+        geom = []
+        for pt in d.get("geom", []) or []:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            try:
+                x = float(pt[0])
+                y = float(pt[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(x) and math.isfinite(y):
+                geom.append([x, y])
+        if len(geom) < 2:
+            raise ValueError("Road geometry must contain at least two valid points.")
+        ref = d.get("ref", "")
+        if not isinstance(ref, str):
+            ref = str(ref)
+        try:
+            bridge_level = int(float(d.get("bridge_level", 0)))
+        except (TypeError, ValueError):
+            bridge_level = 0
+        surface = d.get("surface", "asphalt")
+        if surface not in SURFACE_TYPES:
+            surface = "asphalt"
+        try:
+            max_weight = float(d.get("max_weight", 0.0))
+        except (TypeError, ValueError):
+            max_weight = 0.0
         return Road(
-            d["name"], d["rtype"], d["speed"], d["lanes"], as_bool(d["oneway"]), d["geom"], d["id"],
-            ref=d.get("ref", ""),
-            bridge_level=d.get("bridge_level", 0),
+            name, rtype, speed, lanes, as_bool(d.get("oneway", False)), geom, rid,
+            ref=ref,
+            bridge_level=bridge_level,
             tunnel=as_bool(d.get("tunnel", False)),
-            surface=d.get("surface", "asphalt"),
-            max_weight=d.get("max_weight", 0.0),
+            surface=surface,
+            max_weight=max_weight,
             lit=as_bool(d.get("lit", False)),
         )
 
@@ -1469,7 +1518,10 @@ class App:
         self.selected = None
         self.drag_info = None
         for d in payload.get("roads", []):
-            r = Road.from_dict(d)
+            try:
+                r = Road.from_dict(d)
+            except (ValueError, TypeError):
+                continue
             self.roads[r.id] = r
         self.connectors = self._normalize_connectors(payload.get("connectors", []))
         self.build_graph()
@@ -1675,9 +1727,13 @@ class App:
                 text=True,
                 capture_output=True,
                 check=True,
+                timeout=8,
             )
-            return json.loads(proc.stdout)
-        except Exception:
+            raw = proc.stdout.strip()
+            if not raw:
+                return None
+            return json.loads(raw)
+        except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError):
             return None
 
     def _shortest_time_path_polyglot(self, start, end):
@@ -2309,30 +2365,56 @@ class App:
             messagebox.showerror("Export Error", str(ex))
 
     def _compute_metrics_fallback(self, payload):
-        road_count = 0
+        roads = payload.get("roads", [])
+        if not isinstance(roads, list):
+            roads = []
+        connectors = payload.get("connectors", [])
+        if not isinstance(connectors, list):
+            connectors = []
+        road_count = len(roads)
         total_len = 0.0
         total_speed = 0.0
         total_lanes = 0
-        for r in payload.get("roads", []):
-            geom = r.get("geom", [])
-            if len(geom) < 2:
+        oneway_count = 0
+        for r in roads:
+            if not isinstance(r, dict):
                 continue
-            road_count += 1
-            total_speed += float(r.get("speed", 0.0) or 0.0)
-            total_lanes += int(r.get("lanes", 0) or 0)
+            try:
+                total_speed += float(r.get("speed", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_lanes += int(float(r.get("lanes", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+            if as_bool(r.get("oneway", False)):
+                oneway_count += 1
+            geom = r.get("geom", [])
+            if not isinstance(geom, list):
+                continue
             for i in range(len(geom) - 1):
-                ax, ay = geom[i]
-                bx, by = geom[i + 1]
-                total_len += math.hypot(float(bx) - float(ax), float(by) - float(ay))
+                a = geom[i]
+                b = geom[i + 1]
+                if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)):
+                    continue
+                if len(a) < 2 or len(b) < 2:
+                    continue
+                try:
+                    ax, ay = float(a[0]), float(a[1])
+                    bx, by = float(b[0]), float(b[1])
+                except (TypeError, ValueError):
+                    continue
+                total_len += math.hypot(bx - ax, by - ay)
         avg_speed = (total_speed / road_count) if road_count else 0.0
         avg_lanes = (total_lanes / road_count) if road_count else 0.0
         return {
             "engine": "python-fallback",
             "road_count": road_count,
-            "connector_count": len(payload.get("connectors", [])),
+            "connector_count": len(connectors),
             "total_length_km": total_len / 1000.0,
             "average_speed_limit": avg_speed,
             "average_lanes": avg_lanes,
+            "oneway_share": (oneway_count / road_count) if road_count else 0.0,
         }
 
     def _compute_metrics_polyglot(self, payload):
@@ -2376,15 +2458,23 @@ class App:
             self.selected = None
             self._undo_stack.clear()
             self._redo_stack.clear()
+            skipped = 0
             for d in payload["roads"]:
-                r = Road.from_dict(d)
+                try:
+                    r = Road.from_dict(d)
+                except (ValueError, TypeError):
+                    skipped += 1
+                    continue
                 self.roads[r.id] = r
             self.file  = path
             self.dirty = False
             self.build_graph()
             self._road_count_var.set(str(len(self.roads)))
             self.root.title(f"{APP_TITLE}  -  {path}")
-            self._set_status(f"Loaded {len(self.roads)} features from {path}")
+            if skipped:
+                self._set_status(f"Loaded {len(self.roads)} features from {path}  |  Skipped {skipped} invalid")
+            else:
+                self._set_status(f"Loaded {len(self.roads)} features from {path}")
             self.zoom_fit()
         except (OSError, ValueError, KeyError, struct.error) as ex:
             messagebox.showerror("Load Error", str(ex))
