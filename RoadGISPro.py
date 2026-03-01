@@ -10,6 +10,7 @@ import struct
 import zlib
 import copy
 import heapq
+import time
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -94,6 +95,13 @@ SMOOTH_STEPS = 16
 ROUTE_PICK_PX = 48
 CONNECT_PICK_PX = 20
 CONNECTOR_TRAVEL_HOURS = 0.002
+DRIVE_MAX_SPEED = 200.0
+DRIVE_REVERSE_SPEED = 80.0
+DRIVE_ACCEL = 210.0
+DRIVE_BRAKE = 270.0
+DRIVE_TURN_RATE = 2.4
+DRIVE_LOCK_DIST = 90.0
+DRIVE_HARD_LIMIT_DIST = 220.0
 
 MAP_BG      = "#1a2030"
 DARK_BG     = "#111520"
@@ -288,6 +296,14 @@ class App:
         self._undo_stack    = []
         self._redo_stack    = []
         self._clipboard     = None
+        self._drive_win     = None
+        self._drive_canvas  = None
+        self._drive_after_id = None
+        self._drive_last_tick = None
+        self._drive_keys    = set()
+        self._drive_pos     = None
+        self._drive_heading = 0.0
+        self._drive_speed   = 0.0
 
         root.title(APP_TITLE)
         root.configure(bg=DARK_BG)
@@ -337,6 +353,7 @@ class App:
             ("Zoom Out     -",    self.zoom_out),
             ("Zoom Fit     F",    self.zoom_fit),
             ("Reset View   Home", self.reset_view),
+            ("Drive 3D      T",   self.open_drive_mode),
             None,
             ("Toggle Grid   G",   self.toggle_grid),
             ("Toggle Nodes  N",   self.toggle_nodes),
@@ -385,6 +402,7 @@ class App:
 
         for text, cmd, fg in [
             ("Fit [F]", self.zoom_fit, PANEL_FG),
+            ("Drive 3D [T]", self.open_drive_mode, "#ff8e8e"),
             ("Clear Route", self._clear_route_and_redraw, PANEL_FG),
             ("Delete [Del]", self.delete_selected, ACCENT2),
         ]:
@@ -663,6 +681,7 @@ class App:
             ("Esc",         "Cancel draw"),
             ("R",           "Route mode"),
             ("K",           "Connector mode"),
+            ("T",           "Open 3D drive mode"),
             ("Del",         "Delete selected"),
         ]
         for key, desc in controls:
@@ -780,6 +799,8 @@ class App:
             ("<R>",         guard(lambda: self.set_mode("route"))),
             ("<k>",         guard(lambda: self.set_mode("connect"))),
             ("<K>",         guard(lambda: self.set_mode("connect"))),
+            ("<t>",         guard(self.open_drive_mode)),
+            ("<T>",         guard(self.open_drive_mode)),
         ]
         for seq, handler in bindings:
             self.root.bind(seq, handler)
@@ -797,7 +818,7 @@ class App:
         if mode == "route":
             self._set_status("Route mode active  |  Click start and destination")
         elif mode == "connect":
-            self._set_status("Connect mode active  |  Click two vertices on different/same levels")
+            self._set_status("Connect mode active  |  Click two vertices to build a connector/interchange")
         else:
             self._set_status(f"{mode.capitalize()} mode active")
         self.redraw()
@@ -1253,7 +1274,7 @@ class App:
             c.create_line(x1, y1, x2, y2, fill="#7de2d1", width=2, dash=(6, 4))
             mx = (x1 + x2) / 2
             my = (y1 + y2) / 2
-            c.create_text(mx, my - 8, text=f"L{al}<->L{bl}", fill="#9aeede", font=("Consolas", 7, "bold"))
+            c.create_text(mx, my - 8, text=self._connector_text(conn), fill="#9aeede", font=("Consolas", 7, "bold"))
 
         if self._pending_connector is not None:
             px, py, pl = self._pending_connector
@@ -1543,6 +1564,30 @@ class App:
         except (TypeError, ValueError):
             return None
 
+    def _connector_level_span(self, a, b):
+        return f"{int(a[2])}-{int(b[2])}"
+
+    def _build_connector(self, a, b):
+        kind = "interchange" if int(a[2]) != int(b[2]) else "connector"
+        return {
+            "a": [a[0], a[1], int(a[2])],
+            "b": [b[0], b[1], int(b[2])],
+            "kind": kind,
+            "level_span": self._connector_level_span(a, b),
+        }
+
+    def _connector_text(self, conn):
+        try:
+            a = conn["a"]
+            b = conn["b"]
+            kind = conn.get("kind", "connector")
+            span = conn.get("level_span") or self._connector_level_span(a, b)
+        except Exception:
+            return "Connector"
+        if kind == "interchange":
+            return f"I/C {span}"
+        return f"L{int(a[2])}<->L{int(b[2])}"
+
     def _normalize_connectors(self, connectors):
         normalized = []
         for conn in connectors or []:
@@ -1552,7 +1597,7 @@ class App:
             b = self._coerce_level_node(conn.get("b"))
             if not a or not b or a == b:
                 continue
-            normalized.append({"a": a, "b": b})
+            normalized.append(self._build_connector(a, b))
         return normalized
 
     def _prune_orphan_connectors(self):
@@ -1738,11 +1783,268 @@ class App:
             self.redraw()
             return
         self._push_undo()
-        self.connectors.append({"a": [a[0], a[1], a[2]], "b": [b[0], b[1], b[2]]})
+        conn = self._build_connector(a, b)
+        self.connectors.append(conn)
         self._pending_connector = None
         self.build_graph()
         self.redraw()
-        self._set_status(f"Connector added L{a[2]} <-> L{b[2]}")
+        if conn["kind"] == "interchange":
+            self._set_status(f"Interchange added ({conn['level_span']})")
+        else:
+            self._set_status(f"Connector added L{a[2]} <-> L{b[2]}")
+
+    def _iter_road_segments(self):
+        for r in self.roads.values():
+            for i in range(len(r.geom) - 1):
+                ax, ay = r.geom[i]
+                bx, by = r.geom[i + 1]
+                yield r, ax, ay, bx, by
+
+    def _nearest_segment_projection(self, px, py):
+        best = None
+        best_d = float("inf")
+        for r, ax, ay, bx, by in self._iter_road_segments():
+            dx = bx - ax
+            dy = by - ay
+            denom = dx * dx + dy * dy
+            if denom <= 0:
+                continue
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+            sx = ax + t * dx
+            sy = ay + t * dy
+            d = math.hypot(px - sx, py - sy)
+            if d < best_d:
+                best_d = d
+                best = (sx, sy, math.atan2(dy, dx), r, d)
+        return best
+
+    def _pick_drive_spawn(self):
+        if len(self.route_path) > 1:
+            a = self.route_path[0]
+            b = self.route_path[1]
+            return (a[0], a[1], math.atan2(b[1] - a[1], b[0] - a[0]))
+        if self.selected and len(self.selected.geom) > 1:
+            a = self.selected.geom[0]
+            b = self.selected.geom[1]
+            return (a[0], a[1], math.atan2(b[1] - a[1], b[0] - a[0]))
+        for r in self.roads.values():
+            if len(r.geom) > 1:
+                a = r.geom[0]
+                b = r.geom[1]
+                return (a[0], a[1], math.atan2(b[1] - a[1], b[0] - a[0]))
+        return None
+
+    def _lerp_angle(self, a, b, t):
+        diff = (b - a + math.pi) % (2 * math.pi) - math.pi
+        return a + diff * max(0.0, min(1.0, t))
+
+    def _drive_key_press(self, e):
+        mapping = {"Up": "w", "Down": "s", "Left": "a", "Right": "d"}
+        key = mapping.get(e.keysym, e.keysym.lower())
+        if key in {"w", "a", "s", "d"}:
+            self._drive_keys.add(key)
+
+    def _drive_key_release(self, e):
+        mapping = {"Up": "w", "Down": "s", "Left": "a", "Right": "d"}
+        key = mapping.get(e.keysym, e.keysym.lower())
+        if key in self._drive_keys:
+            self._drive_keys.remove(key)
+
+    def open_drive_mode(self):
+        if not self.roads:
+            self._set_status("Drive mode unavailable: draw at least one road first")
+            return
+        if self._drive_win and self._drive_win.winfo_exists():
+            self._drive_win.deiconify()
+            self._drive_win.lift()
+            self._drive_win.focus_force()
+            return
+        spawn = self._pick_drive_spawn()
+        if not spawn:
+            self._set_status("Drive mode unavailable: no drivable segment found")
+            return
+        self._drive_pos = (spawn[0], spawn[1])
+        self._drive_heading = spawn[2]
+        self._drive_speed = 0.0
+        self._drive_keys = set()
+
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - 3D Drive")
+        win.geometry("980x620")
+        win.configure(bg="#0a0d15")
+        win.minsize(700, 440)
+        win.bind("<KeyPress>", self._drive_key_press)
+        win.bind("<KeyRelease>", self._drive_key_release)
+        win.bind("<Escape>", lambda _e: self.close_drive_mode())
+        win.protocol("WM_DELETE_WINDOW", self.close_drive_mode)
+
+        hud = tk.Label(
+            win,
+            text="WASD / Arrow Keys: Drive   |   Esc: Exit",
+            bg="#0a0d15",
+            fg="#98a8c8",
+            font=("Consolas", 10, "bold"),
+            pady=8,
+        )
+        hud.pack(side="top", fill="x")
+
+        self._drive_canvas = tk.Canvas(win, bg="#070a12", highlightthickness=0, bd=0)
+        self._drive_canvas.pack(side="top", fill="both", expand=True)
+
+        self._drive_win = win
+        self._drive_last_tick = time.perf_counter()
+        self._set_status("3D drive mode active")
+        win.focus_force()
+        self._drive_tick()
+
+    def close_drive_mode(self):
+        if self._drive_after_id and self._drive_win and self._drive_win.winfo_exists():
+            try:
+                self._drive_win.after_cancel(self._drive_after_id)
+            except tk.TclError:
+                pass
+        self._drive_after_id = None
+        self._drive_last_tick = None
+        self._drive_keys = set()
+        if self._drive_win and self._drive_win.winfo_exists():
+            try:
+                self._drive_win.destroy()
+            except tk.TclError:
+                pass
+        self._drive_win = None
+        self._drive_canvas = None
+        self._set_status("3D drive mode closed")
+
+    def _drive_tick(self):
+        if not (self._drive_win and self._drive_win.winfo_exists() and self._drive_canvas):
+            self._drive_after_id = None
+            return
+        now = time.perf_counter()
+        if self._drive_last_tick is None:
+            dt = 1 / 60
+        else:
+            dt = max(0.005, min(0.05, now - self._drive_last_tick))
+        self._drive_last_tick = now
+
+        throttle = (1 if "w" in self._drive_keys else 0) - (1 if "s" in self._drive_keys else 0)
+        steer = (1 if "d" in self._drive_keys else 0) - (1 if "a" in self._drive_keys else 0)
+
+        if throttle > 0:
+            self._drive_speed += DRIVE_ACCEL * dt
+        elif throttle < 0:
+            self._drive_speed -= DRIVE_BRAKE * dt
+        else:
+            self._drive_speed *= max(0.0, 1.0 - 1.3 * dt)
+
+        self._drive_speed = max(-DRIVE_REVERSE_SPEED, min(DRIVE_MAX_SPEED, self._drive_speed))
+        turn_gain = max(0.18, min(1.0, abs(self._drive_speed) / DRIVE_MAX_SPEED))
+        self._drive_heading += steer * DRIVE_TURN_RATE * dt * turn_gain * (1 if self._drive_speed >= 0 else -1)
+
+        x, y = self._drive_pos
+        nx = x + math.cos(self._drive_heading) * self._drive_speed * dt
+        ny = y + math.sin(self._drive_heading) * self._drive_speed * dt
+
+        nearest = self._nearest_segment_projection(nx, ny)
+        if nearest:
+            sx, sy, seg_heading, _road, dist = nearest
+            if dist <= DRIVE_LOCK_DIST:
+                snap = min(1.0, dt * (8.0 - 6.0 * (dist / max(DRIVE_LOCK_DIST, 1.0))))
+                nx = nx + (sx - nx) * snap
+                ny = ny + (sy - ny) * snap
+                align = min(1.0, dt * 2.5)
+                self._drive_heading = self._lerp_angle(self._drive_heading, seg_heading, align)
+                if dist > DRIVE_LOCK_DIST * 0.6:
+                    self._drive_speed *= 0.97
+            elif dist > DRIVE_HARD_LIMIT_DIST:
+                self._drive_speed *= 0.78
+
+        self._drive_pos = (nx, ny)
+        self._draw_drive_scene(nearest)
+        self._drive_after_id = self._drive_win.after(16, self._drive_tick)
+
+    def _draw_drive_scene(self, nearest):
+        c = self._drive_canvas
+        w = c.winfo_width() or 980
+        h = c.winfo_height() or 620
+        c.delete("all")
+
+        horizon = h * 0.44
+        c.create_rectangle(0, 0, w, horizon, fill="#121a2c", outline="")
+        c.create_rectangle(0, horizon, w, h, fill="#1b1a18", outline="")
+
+        if self._drive_pos is None:
+            return
+
+        px, py = self._drive_pos
+        heading = self._drive_heading
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+        near_plane = 4.0
+        lane_width = 10.0
+        seg_draw = []
+
+        for road, ax, ay, bx, by in self._iter_road_segments():
+            dax = ax - px
+            day = ay - py
+            dbx = bx - px
+            dby = by - py
+            za = cos_h * dax + sin_h * day
+            xa = -sin_h * dax + cos_h * day
+            zb = cos_h * dbx + sin_h * dby
+            xb = -sin_h * dbx + cos_h * dby
+            if za <= near_plane and zb <= near_plane:
+                continue
+            if za <= near_plane or zb <= near_plane:
+                t = (near_plane - za) / (zb - za)
+                if za < near_plane:
+                    za = near_plane
+                    xa = xa + t * (xb - xa)
+                else:
+                    zb = near_plane
+                    xb = xb + t * (xa - xb)
+
+            def proj(xc, zc):
+                scale = 760.0 / (zc + 70.0)
+                sx = w * 0.5 + xc * scale
+                sy = horizon + 255.0 / (zc + 45.0)
+                return sx, sy, scale
+
+            l1x, l1y, _ = proj(xa - lane_width, za)
+            r1x, r1y, _ = proj(xa + lane_width, za)
+            l2x, l2y, _ = proj(xb - lane_width, zb)
+            r2x, r2y, _ = proj(xb + lane_width, zb)
+            depth = min(za, zb)
+            seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y))
+
+        seg_draw.sort(key=lambda it: it[0], reverse=True)
+        for _depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y in seg_draw:
+            road_col = ROAD_STYLES.get(road.rtype, {}).get("color", "#777")
+            c.create_polygon(l1x, l1y, r1x, r1y, r2x, r2y, l2x, l2y, fill="#2d2a27", outline="")
+            c.create_line(l1x, l1y, l2x, l2y, fill=road_col, width=2)
+            c.create_line(r1x, r1y, r2x, r2y, fill=road_col, width=2)
+
+        cx = w * 0.5
+        base_y = h - 72
+        c.create_polygon(
+            cx - 30, base_y,
+            cx + 30, base_y,
+            cx + 22, base_y - 42,
+            cx - 22, base_y - 42,
+            fill="#d91010",
+            outline="#ffaeae",
+            width=2,
+        )
+        c.create_rectangle(cx - 12, base_y - 34, cx + 12, base_y - 20, fill="#8a0000", outline="")
+
+        speed_kmh = max(0.0, self._drive_speed * 0.9)
+        c.create_text(14, 14, anchor="nw", fill="#dce7ff", font=("Consolas", 11, "bold"),
+                      text=f"Speed: {speed_kmh:5.1f} km/h")
+        c.create_text(14, 34, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
+                      text="Controls: W/S throttle, A/D steer, Arrow keys supported")
+        if nearest:
+            _sx, _sy, _ang, road, dist = nearest
+            c.create_text(14, 54, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
+                          text=f"Road: {road.name or 'Unnamed'} | L{int(road.bridge_level)} | offset {dist:.1f}")
 
     def apply(self):
         if not self.selected:
@@ -2018,6 +2320,7 @@ class App:
 
     def on_close(self):
         if self._ask_save():
+            self.close_drive_mode()
             self.root.destroy()
 
     def _set_status(self, msg):
@@ -2028,3 +2331,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     App(root)
     root.mainloop()
+
