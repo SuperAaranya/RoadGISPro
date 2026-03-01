@@ -4,6 +4,8 @@ This folder adds optional cross-platform engines:
 
 - `rust_router`: fastest-route solver (Dijkstra) in Rust
 - `js/metrics.js`: export analytics engine in JavaScript (Node.js)
+- `go/metrics.go`: export analytics engine in Go
+- `csharp/`: export analytics engine in C# (.NET)
 
 ## Why this exists
 
@@ -23,7 +25,17 @@ The app will use `target/release/rust_router(.exe)` once built.
 Install Node.js, then no build step is required.  
 The app invokes `polyglot/js/metrics.js` during JSON export.
 
+## Go metrics
+
+Install Go, then no build step is required.  
+The app can invoke `go run polyglot/go/metrics.go` during JSON export.
+
+## C# metrics
+
+Install .NET SDK 8+, then no manual build step is required.  
+The app can invoke `dotnet run --project polyglot/csharp/MetricsEngine.csproj -c Release`.
+
 ## Runtime behavior
 
 - Routing: Rust first, Python fallback
-- Metrics: JavaScript first, Python fallback
+- Metrics: JavaScript, then Go, then C#, then Python fallback

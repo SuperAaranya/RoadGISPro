@@ -27,6 +27,8 @@ RUST_ROUTER_BIN = os.path.join(
     "rust_router.exe" if os.name == "nt" else "rust_router",
 )
 JS_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "js", "metrics.js")
+GO_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "go", "metrics.go")
+CSHARP_METRICS_PROJECT = os.path.join(POLYGLOT_DIR, "csharp", "MetricsEngine.csproj")
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -1719,7 +1721,7 @@ class App:
         path.reverse()
         return path, dist[end]
 
-    def _run_json_process(self, cmd, payload):
+    def _run_json_process(self, cmd, payload, timeout=8):
         try:
             proc = subprocess.run(
                 cmd,
@@ -1727,7 +1729,7 @@ class App:
                 text=True,
                 capture_output=True,
                 check=True,
-                timeout=8,
+                timeout=timeout,
             )
             raw = proc.stdout.strip()
             if not raw:
@@ -2418,10 +2420,17 @@ class App:
         }
 
     def _compute_metrics_polyglot(self, payload):
+        engines = []
         if os.path.exists(JS_METRICS_SCRIPT) and shutil.which("node"):
-            out = self._run_json_process(["node", JS_METRICS_SCRIPT], payload)
+            engines.append(("javascript", ["node", JS_METRICS_SCRIPT], 8))
+        if os.path.exists(GO_METRICS_SCRIPT) and shutil.which("go"):
+            engines.append(("go", ["go", "run", GO_METRICS_SCRIPT], 10))
+        if os.path.exists(CSHARP_METRICS_PROJECT) and shutil.which("dotnet"):
+            engines.append(("csharp", ["dotnet", "run", "--project", CSHARP_METRICS_PROJECT, "-c", "Release"], 20))
+        for engine_name, cmd, timeout in engines:
+            out = self._run_json_process(cmd, payload, timeout=timeout)
             if isinstance(out, dict):
-                out.setdefault("engine", "javascript")
+                out.setdefault("engine", engine_name)
                 return out
         return self._compute_metrics_fallback(payload)
 
