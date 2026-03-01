@@ -12,7 +12,7 @@ This folder adds optional cross-platform engines:
 ## Build Rust router
 
 ```powershell
-cd "C:\Users\Aaranya\Desktop\Programming\Extra\App\App Making\RoadGISProNotInGithub\polyglot\rust_router"
+cd "[Insert Path]\YourRoadGISPath\polyglot\rust_router"
 cargo build --release
 ```
 
