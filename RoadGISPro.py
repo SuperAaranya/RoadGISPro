@@ -1878,9 +1878,8 @@ class App:
 
     def save(self):
         if not self.file:
-            self.save_as()
-            return
-        self._write_file(self.file)
+            return self.save_as()
+        return self._write_file(self.file)
 
     def save_as(self):
         path = filedialog.asksaveasfilename(
@@ -1890,7 +1889,8 @@ class App:
         )
         if path:
             self.file = path
-            self._write_file(path)
+            return self._write_file(path)
+        return False
 
     def _write_file(self, path):
         tmp_path = f"{path}.tmp"
@@ -1906,8 +1906,10 @@ class App:
             self.dirty = False
             self._set_status(f"Saved  {path}")
             self.root.title(f"{APP_TITLE}  -  {path}")
+            return True
         except OSError as ex:
             messagebox.showerror("Save Error", str(ex))
+            return False
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -1936,7 +1938,8 @@ class App:
             messagebox.showerror("Export Error", str(ex))
 
     def load(self):
-        self._ask_save()
+        if not self._ask_save():
+            return
         path = filedialog.askopenfilename(
             filetypes=[
                 ("RoadGIS Layer", f"*{FILE_EXT}"),
@@ -1981,7 +1984,8 @@ class App:
             messagebox.showerror("Load Error", str(ex))
 
     def new(self):
-        self._ask_save()
+        if not self._ask_save():
+            return
         self.roads     = {}
         self.connectors = []
         self._pending_connector = None
@@ -2002,13 +2006,19 @@ class App:
 
     def _ask_save(self):
         if self.dirty:
-            if messagebox.askyesno("Unsaved Changes",
-                                   "Save changes before continuing?"):
-                self.save()
+            choice = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                "Save changes before continuing?",
+            )
+            if choice is None:
+                return False
+            if choice:
+                return self.save()
+        return True
 
     def on_close(self):
-        self._ask_save()
-        self.root.destroy()
+        if self._ask_save():
+            self.root.destroy()
 
     def _set_status(self, msg):
         self._status_var.set(msg)
