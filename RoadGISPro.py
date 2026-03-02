@@ -29,6 +29,11 @@ RUST_ROUTER_BIN = os.path.join(
 JS_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "js", "metrics.js")
 GO_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "go", "metrics.go")
 CSHARP_METRICS_PROJECT = os.path.join(POLYGLOT_DIR, "csharp", "MetricsEngine.csproj")
+PLUGIN_DIR = os.path.join(POLYGLOT_DIR, "plugins")
+PLUGIN_REGISTRY_PATH = os.path.join(PLUGIN_DIR, "registry.json")
+PLUGIN_MANIFESTS_DIR = os.path.join(PLUGIN_DIR, "manifests")
+GO_VALIDATOR_SCRIPT = os.path.join(POLYGLOT_DIR, "validators", "go_validator", "validator.go")
+RUST_VALIDATOR_MANIFEST = os.path.join(POLYGLOT_DIR, "validators", "rust_validator", "Cargo.toml")
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -365,12 +370,15 @@ class App:
         self._drive_pos     = None
         self._drive_heading = 0.0
         self._drive_speed   = 0.0
+        self._plugins       = []
+        self._plugin_manager_win = None
 
         root.title(APP_TITLE)
         root.configure(bg=DARK_BG)
         root.geometry("1340x820")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self._load_plugins_registry()
         self._build_menu()
         self._build_toolbar()
         self._build_main()
@@ -432,6 +440,17 @@ class App:
             ("Delete Road      Del",      self.delete_selected),
             ("Remove Last Node Backspace", self.delete_last_node),
             ("Clear Canvas",              self.clear_canvas),
+        ])
+
+        menu("Tools", [
+            ("Validate Layer File", self.validate_layer_file_dialog),
+            ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
+        ])
+
+        menu("Plugins", [
+            ("Plugin Manager", self.open_plugin_manager),
+            ("Reload Plugin Registry", self._reload_plugins_registry),
+            ("Install Built-in Plugins", self.install_builtin_plugins),
         ])
 
     def _build_toolbar(self):
@@ -833,6 +852,8 @@ class App:
             ("<Control-C>", lambda e: self.copy_selected()),
             ("<Control-v>", lambda e: self.paste_road()),
             ("<Control-V>", lambda e: self.paste_road()),
+            ("<Control-Shift-P>", lambda e: self.open_plugin_manager()),
+            ("<Control-Shift-V>", lambda e: self.validate_layer_file_dialog()),
             ("<Delete>",    guard(self.delete_selected)),
             ("<BackSpace>", guard(self.delete_last_node)),
             ("<Escape>",    guard(self.escape_action)),
@@ -2299,6 +2320,402 @@ class App:
             self.redraw()
             self._set_status("Layer cleared")
 
+    def _default_plugin_manifests(self):
+        if not os.path.isdir(PLUGIN_MANIFESTS_DIR):
+            return []
+        manifests = []
+        for name in sorted(os.listdir(PLUGIN_MANIFESTS_DIR)):
+            if name.lower().endswith(".json"):
+                manifests.append(os.path.join(PLUGIN_MANIFESTS_DIR, name))
+        return manifests
+
+    def _normalize_plugin_entry(self, entry, default_enabled=False):
+        if not isinstance(entry, dict):
+            return None
+        plugin_id = str(entry.get("id", "")).strip()
+        name = str(entry.get("name", "")).strip()
+        language = str(entry.get("language", "unknown")).strip().lower()
+        description = str(entry.get("description", "")).strip()
+        command = entry.get("command")
+        hooks = entry.get("hooks", ["export_json"])
+        timeout = entry.get("timeout", 6)
+        enabled = bool(entry.get("enabled", default_enabled))
+        if not plugin_id or not name:
+            return None
+        if not isinstance(command, list) or not command:
+            return None
+        command = [str(tok) for tok in command if str(tok).strip()]
+        if not command:
+            return None
+        if not isinstance(hooks, list) or not hooks:
+            hooks = ["export_json"]
+        hooks = [str(h).strip() for h in hooks if str(h).strip()]
+        if not hooks:
+            hooks = ["export_json"]
+        try:
+            timeout = max(1, min(30, int(timeout)))
+        except (TypeError, ValueError):
+            timeout = 6
+        return {
+            "id": plugin_id,
+            "name": name,
+            "language": language,
+            "description": description,
+            "command": command,
+            "hooks": hooks,
+            "timeout": timeout,
+            "enabled": enabled,
+        }
+
+    def _expand_command_tokens(self, command):
+        expanded = []
+        for tok in command:
+            s = str(tok)
+            s = s.replace("{{BASE_DIR}}", BASE_DIR)
+            s = s.replace("{{POLYGLOT_DIR}}", POLYGLOT_DIR)
+            s = s.replace("{{PLUGIN_DIR}}", PLUGIN_DIR)
+            expanded.append(s)
+        return expanded
+
+    def _load_plugins_registry(self):
+        os.makedirs(PLUGIN_DIR, exist_ok=True)
+        plugins = []
+        if os.path.exists(PLUGIN_REGISTRY_PATH):
+            try:
+                with open(PLUGIN_REGISTRY_PATH, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    for entry in loaded:
+                        norm = self._normalize_plugin_entry(entry)
+                        if norm:
+                            plugins.append(norm)
+            except (OSError, json.JSONDecodeError):
+                plugins = []
+        by_id = {p["id"]: p for p in plugins}
+        for manifest_path in self._default_plugin_manifests():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    entry = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            norm = self._normalize_plugin_entry(entry, default_enabled=False)
+            if norm and norm["id"] not in by_id:
+                by_id[norm["id"]] = norm
+        self._plugins = sorted(by_id.values(), key=lambda p: (p["name"].lower(), p["id"]))
+        self._save_plugins_registry()
+
+    def _save_plugins_registry(self):
+        os.makedirs(PLUGIN_DIR, exist_ok=True)
+        try:
+            with open(PLUGIN_REGISTRY_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._plugins, f, indent=2)
+        except OSError:
+            pass
+
+    def _reload_plugins_registry(self):
+        self._load_plugins_registry()
+        self._refresh_plugin_manager_list()
+        self._set_status(f"Plugin registry reloaded ({len(self._plugins)} plugins)")
+
+    def install_builtin_plugins(self):
+        installed = 0
+        by_id = {p["id"] for p in self._plugins}
+        for manifest_path in self._default_plugin_manifests():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    entry = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            norm = self._normalize_plugin_entry(entry, default_enabled=False)
+            if norm and norm["id"] not in by_id:
+                self._plugins.append(norm)
+                by_id.add(norm["id"])
+                installed += 1
+        self._plugins.sort(key=lambda p: (p["name"].lower(), p["id"]))
+        self._save_plugins_registry()
+        self._refresh_plugin_manager_list()
+        self._set_status(f"Installed {installed} built-in plugins")
+
+    def _selected_plugin_id(self):
+        tree = getattr(self, "_plugin_tree", None)
+        if not tree:
+            return None
+        sel = tree.selection()
+        if not sel:
+            return None
+        values = tree.item(sel[0], "values")
+        if not values:
+            return None
+        return values[0]
+
+    def _refresh_plugin_manager_list(self):
+        tree = getattr(self, "_plugin_tree", None)
+        if not tree:
+            return
+        tree.delete(*tree.get_children())
+        for plugin in self._plugins:
+            hooks = ",".join(plugin.get("hooks", []))
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    plugin["id"],
+                    "Yes" if plugin.get("enabled") else "No",
+                    plugin.get("name", ""),
+                    plugin.get("language", ""),
+                    hooks,
+                    plugin.get("timeout", 6),
+                ),
+            )
+
+    def _install_plugin_manifest(self, manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                entry = json.load(f)
+        except (OSError, json.JSONDecodeError) as ex:
+            messagebox.showerror("Plugin Install Error", f"Failed to read manifest:\n{ex}")
+            return
+        norm = self._normalize_plugin_entry(entry, default_enabled=True)
+        if not norm:
+            messagebox.showerror("Plugin Install Error", "Manifest is missing required fields.")
+            return
+        for i, plugin in enumerate(self._plugins):
+            if plugin["id"] == norm["id"]:
+                self._plugins[i] = norm
+                self._save_plugins_registry()
+                self._refresh_plugin_manager_list()
+                self._set_status(f"Plugin updated: {norm['name']}")
+                return
+        self._plugins.append(norm)
+        self._plugins.sort(key=lambda p: (p["name"].lower(), p["id"]))
+        self._save_plugins_registry()
+        self._refresh_plugin_manager_list()
+        self._set_status(f"Plugin installed: {norm['name']}")
+
+    def install_plugin_from_manifest_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Install Plugin Manifest",
+            filetypes=[("Plugin Manifest", "*.json"), ("All Files", "*.*")],
+        )
+        if path:
+            self._install_plugin_manifest(path)
+
+    def _toggle_selected_plugin(self):
+        plugin_id = self._selected_plugin_id()
+        if not plugin_id:
+            return
+        for plugin in self._plugins:
+            if plugin["id"] == plugin_id:
+                plugin["enabled"] = not plugin.get("enabled", False)
+                state = "enabled" if plugin["enabled"] else "disabled"
+                self._set_status(f"Plugin {state}: {plugin['name']}")
+                break
+        self._save_plugins_registry()
+        self._refresh_plugin_manager_list()
+
+    def _remove_selected_plugin(self):
+        plugin_id = self._selected_plugin_id()
+        if not plugin_id:
+            return
+        for plugin in self._plugins:
+            if plugin["id"] == plugin_id:
+                if not messagebox.askyesno("Remove Plugin", f"Remove plugin '{plugin['name']}' from registry?"):
+                    return
+                break
+        self._plugins = [p for p in self._plugins if p["id"] != plugin_id]
+        self._save_plugins_registry()
+        self._refresh_plugin_manager_list()
+        self._set_status(f"Plugin removed: {plugin_id}")
+
+    def open_plugin_manager(self):
+        if self._plugin_manager_win and self._plugin_manager_win.winfo_exists():
+            self._plugin_manager_win.lift()
+            self._plugin_manager_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Plugin Manager")
+        win.geometry("960x520")
+        win.configure(bg=DARK_BG)
+        win.minsize(760, 420)
+        self._plugin_manager_win = win
+
+        top = tk.Frame(win, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        cols = ("id", "enabled", "name", "language", "hooks", "timeout")
+        tree = ttk.Treeview(top, columns=cols, show="headings", height=14)
+        self._plugin_tree = tree
+        tree.heading("id", text="ID")
+        tree.heading("enabled", text="Enabled")
+        tree.heading("name", text="Name")
+        tree.heading("language", text="Language")
+        tree.heading("hooks", text="Hooks")
+        tree.heading("timeout", text="Timeout(s)")
+        tree.column("id", width=170, anchor="w")
+        tree.column("enabled", width=70, anchor="center")
+        tree.column("name", width=180, anchor="w")
+        tree.column("language", width=90, anchor="center")
+        tree.column("hooks", width=180, anchor="w")
+        tree.column("timeout", width=90, anchor="center")
+        tree.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 4))
+
+        btns = tk.Frame(top, bg=PANEL_BG)
+        btns.pack(side="top", fill="x", padx=8, pady=(4, 8))
+        for text, cmd, color in [
+            ("Install Manifest", self.install_plugin_from_manifest_dialog, ACCENT),
+            ("Install Built-ins", self.install_builtin_plugins, "#3d9b7a"),
+            ("Enable / Disable", self._toggle_selected_plugin, "#7b88b3"),
+            ("Remove", self._remove_selected_plugin, ACCENT2),
+            ("Reload", self._reload_plugins_registry, "#5776b2"),
+            ("Run on Current Layer", self.run_plugins_on_current_layer, "#c08f3f"),
+        ]:
+            tk.Button(
+                btns, text=text, command=cmd,
+                bg=color, fg="white", relief="flat", bd=0,
+                font=("Consolas", 9, "bold"), padx=10, pady=5, cursor="hand2",
+            ).pack(side="left", padx=4)
+        self._refresh_plugin_manager_list()
+
+    def _run_plugin_process(self, plugin, payload):
+        cmd = self._expand_command_tokens(plugin.get("command", []))
+        timeout = plugin.get("timeout", 6)
+        out = self._run_json_process(cmd, payload, timeout=timeout)
+        if isinstance(out, dict):
+            out.setdefault("plugin_id", plugin.get("id"))
+            out.setdefault("plugin_name", plugin.get("name"))
+            out.setdefault("engine", plugin.get("language", "unknown"))
+        return out
+
+    def _run_plugins_for_hook(self, hook, payload):
+        outputs = []
+        errors = []
+        for plugin in self._plugins:
+            if not plugin.get("enabled", False):
+                continue
+            hooks = plugin.get("hooks", [])
+            if hook not in hooks:
+                continue
+            result = self._run_plugin_process(plugin, payload)
+            if isinstance(result, dict):
+                outputs.append(result)
+            else:
+                errors.append({
+                    "plugin_id": plugin.get("id"),
+                    "plugin_name": plugin.get("name"),
+                    "error": "Plugin execution failed",
+                })
+        return outputs, errors
+
+    def run_plugins_on_current_layer(self):
+        payload = {
+            "roads": [r.to_dict() for r in self.roads.values()],
+            "connectors": self.connectors,
+            "feature_count": len(self.roads),
+        }
+        outputs, errors = self._run_plugins_for_hook("manual", payload)
+        summary = [f"Plugins run: {len(outputs)} succeeded"]
+        if errors:
+            summary.append(f"{len(errors)} failed")
+        if outputs:
+            names = ", ".join(o.get("plugin_name", o.get("plugin_id", "?")) for o in outputs[:6])
+            summary.append(f"OK: {names}")
+        if errors:
+            names = ", ".join(e.get("plugin_name", e.get("plugin_id", "?")) for e in errors[:6])
+            summary.append(f"Failed: {names}")
+        messagebox.showinfo("Plugin Run Result", "\n".join(summary))
+        self._set_status("Plugins executed on current layer")
+
+    def _payload_validation_issues(self, payload):
+        issues = []
+        if not isinstance(payload, dict):
+            return ["Payload is not an object"]
+        roads = payload.get("roads")
+        connectors = payload.get("connectors", [])
+        if not isinstance(roads, list):
+            issues.append("'roads' must be an array")
+            roads = []
+        if not isinstance(connectors, list):
+            issues.append("'connectors' must be an array")
+            connectors = []
+        for idx, road in enumerate(roads):
+            if not isinstance(road, dict):
+                issues.append(f"road[{idx}] is not an object")
+                continue
+            if "name" not in road:
+                issues.append(f"road[{idx}] missing 'name'")
+            geom = road.get("geom")
+            if not isinstance(geom, list) or len(geom) < 2:
+                issues.append(f"road[{idx}] has invalid geometry")
+                continue
+            for j, pt in enumerate(geom):
+                if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                    issues.append(f"road[{idx}].geom[{j}] invalid point")
+                    break
+        for idx, conn in enumerate(connectors):
+            if not isinstance(conn, dict):
+                issues.append(f"connector[{idx}] is not an object")
+                continue
+            for side in ("a", "b"):
+                node = conn.get(side)
+                if not isinstance(node, (list, tuple)) or len(node) != 3:
+                    issues.append(f"connector[{idx}].{side} must be [x,y,level]")
+        return issues
+
+    def _validate_payload_polyglot(self, payload):
+        validators = []
+        if os.path.exists(RUST_VALIDATOR_MANIFEST) and shutil.which("cargo"):
+            validators.append(("rust-validator", ["cargo", "run", "--quiet", "--release", "--manifest-path", RUST_VALIDATOR_MANIFEST], 20))
+        if os.path.exists(GO_VALIDATOR_SCRIPT) and shutil.which("go"):
+            validators.append(("go-validator", ["go", "run", GO_VALIDATOR_SCRIPT], 12))
+        for engine, cmd, timeout in validators:
+            out = self._run_json_process(cmd, payload, timeout=timeout)
+            if isinstance(out, dict):
+                out.setdefault("engine", engine)
+                if isinstance(out.get("issues"), list):
+                    return out
+        return None
+
+    def validate_layer_file_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Validate Layer File",
+            filetypes=[
+                ("RoadGIS Layer", f"*{FILE_EXT}"),
+                ("JSON", "*.json"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        issues = []
+        payload = None
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if os.path.splitext(path)[1].lower() == ".json":
+                payload = json.loads(raw.decode("utf-8"))
+                if isinstance(payload, list):
+                    payload = {"roads": payload, "connectors": []}
+            else:
+                payload = decode_rgis(raw)
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, struct.error) as ex:
+            messagebox.showerror("Validation Error", f"File decode failed:\n{ex}")
+            return
+        issues.extend(self._payload_validation_issues(payload))
+        poly_out = self._validate_payload_polyglot(payload)
+        if poly_out and isinstance(poly_out.get("issues"), list):
+            for issue in poly_out["issues"]:
+                if isinstance(issue, str) and issue not in issues:
+                    issues.append(issue)
+        if issues:
+            preview = "\n".join(f"- {msg}" for msg in issues[:24])
+            if len(issues) > 24:
+                preview += f"\n... and {len(issues) - 24} more"
+            messagebox.showwarning("Validation Result", f"Found {len(issues)} issue(s):\n{preview}")
+            self._set_status(f"Validation found {len(issues)} issue(s)")
+        else:
+            messagebox.showinfo("Validation Result", "File is valid.")
+            self._set_status("Validation passed")
+
     def save(self):
         if not self.file:
             return self.save_as()
@@ -2354,6 +2771,13 @@ class App:
                 "connectors": self.connectors,
             }
             metrics = self._compute_metrics_polyglot(payload)
+            plugin_payload = {
+                "roads": payload["roads"],
+                "connectors": payload["connectors"],
+                "feature_count": len(self.roads),
+                "metrics": metrics,
+            }
+            plugin_outputs, plugin_errors = self._run_plugins_for_hook("export_json", plugin_payload)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({
                     "roads":         payload["roads"],
@@ -2361,6 +2785,8 @@ class App:
                     "feature_count": len(self.roads),
                     "graph_nodes":   len(self.graph),
                     "metrics":       metrics,
+                    "plugin_outputs": plugin_outputs,
+                    "plugin_errors": plugin_errors,
                 }, f, indent=2)
             self._set_status(f"Exported to {path}")
         except OSError as ex:
@@ -2524,6 +2950,11 @@ class App:
     def on_close(self):
         if self._ask_save():
             self.close_drive_mode()
+            if self._plugin_manager_win and self._plugin_manager_win.winfo_exists():
+                try:
+                    self._plugin_manager_win.destroy()
+                except tk.TclError:
+                    pass
             self.root.destroy()
 
     def _set_status(self, msg):

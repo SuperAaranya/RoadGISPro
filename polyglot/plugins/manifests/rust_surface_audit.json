@@ -1,0 +1,19 @@
+{
+  "id": "rust_surface_audit",
+  "name": "Rust Surface Audit",
+  "language": "rust",
+  "description": "Audits surface distribution and weight-limited roads.",
+  "command": [
+    "cargo",
+    "run",
+    "--quiet",
+    "--release",
+    "--manifest-path",
+    "{{POLYGLOT_DIR}}/plugins/rust_surface_audit/Cargo.toml"
+  ],
+  "hooks": [
+    "export_json",
+    "manual"
+  ],
+  "timeout": 18
+}

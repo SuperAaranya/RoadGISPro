@@ -6,6 +6,8 @@ This folder adds optional cross-platform engines:
 - `js/metrics.js`: export analytics engine in JavaScript (Node.js)
 - `go/metrics.go`: export analytics engine in Go
 - `csharp/`: export analytics engine in C# (.NET)
+- `plugins/`: installable plugin engines and manifests (Go + Rust samples)
+- `validators/`: file-format validators (Go + Rust)
 
 ## Why this exists
 
@@ -39,3 +41,27 @@ The app can invoke `dotnet run --project polyglot/csharp/MetricsEngine.csproj -c
 
 - Routing: Rust first, Python fallback
 - Metrics: JavaScript, then Go, then C#, then Python fallback
+- Plugins: enabled plugins run on `export_json` and manual runs
+- Validation: Rust validator, then Go validator, then Python checks
+
+## Plugin Manager (QGIS-style workflow)
+
+Inside the app:
+
+- Open `Plugins > Plugin Manager`
+- Install from `*.json` manifest, or click `Install Built-ins`
+- Enable/Disable or Remove plugins
+- Run plugins manually on current layer
+
+Manifest fields:
+
+- `id`, `name`, `language`, `description`
+- `command` (array of executable tokens)
+- `hooks` (for example `["export_json", "manual"]`)
+- `timeout` (seconds)
+
+Token placeholders supported in commands:
+
+- `{{BASE_DIR}}`
+- `{{POLYGLOT_DIR}}`
+- `{{PLUGIN_DIR}}`

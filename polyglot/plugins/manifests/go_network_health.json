@@ -1,0 +1,16 @@
+{
+  "id": "go_network_health",
+  "name": "Go Network Health",
+  "language": "go",
+  "description": "Summarizes road types and bridge/tunnel feature counts.",
+  "command": [
+    "go",
+    "run",
+    "{{POLYGLOT_DIR}}/plugins/go_network_health/plugin.go"
+  ],
+  "hooks": [
+    "export_json",
+    "manual"
+  ],
+  "timeout": 10
+}
