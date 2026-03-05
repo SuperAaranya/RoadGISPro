@@ -2397,25 +2397,39 @@ class App:
         except OSError as ex:
             self._log_exception("Failed to save runtime config", ex, context=POLYGLOT_RUNTIME_CONFIG)
 
-    def open_polyglot_setup(self):
+    def _recommended_languages_for_os(self, os_choice):
+        os_key = str(os_choice).strip().lower()
+        base = ["rust_router", "js_metrics", "go_metrics", "rust_validator", "go_validator", "plugins"]
+        if os_key.startswith("windows"):
+            return base + ["csharp_metrics", "ruby_metrics", "java_metrics"]
+        if os_key.startswith("debian") or os_key.startswith("linux"):
+            return base + ["ruby_metrics", "java_metrics"]
+        if os_key.startswith("mac"):
+            return base + ["ruby_metrics", "java_metrics"]
+        return base
+
+    def open_polyglot_setup(self, selected_tokens=None):
         if not os.path.exists(POLYGLOT_SETUP_SCRIPT):
             messagebox.showerror("Polyglot Setup", f"Setup script not found:\n{POLYGLOT_SETUP_SCRIPT}")
             return
-        selected = []
-        mapping = [
-            ("rust_router", "allow_rust_router"),
-            ("js_metrics", "allow_javascript_metrics"),
-            ("go_metrics", "allow_go_metrics"),
-            ("csharp_metrics", "allow_csharp_metrics"),
-            ("ruby_metrics", "allow_ruby_metrics"),
-            ("java_metrics", "allow_java_metrics"),
-            ("rust_validator", "allow_rust_validator"),
-            ("go_validator", "allow_go_validator"),
-            ("plugins", "allow_plugins"),
-        ]
-        for token, key in mapping:
-            if self._runtime_cfg.get(key, False):
-                selected.append(token)
+        if selected_tokens is None:
+            selected = []
+            mapping = [
+                ("rust_router", "allow_rust_router"),
+                ("js_metrics", "allow_javascript_metrics"),
+                ("go_metrics", "allow_go_metrics"),
+                ("csharp_metrics", "allow_csharp_metrics"),
+                ("ruby_metrics", "allow_ruby_metrics"),
+                ("java_metrics", "allow_java_metrics"),
+                ("rust_validator", "allow_rust_validator"),
+                ("go_validator", "allow_go_validator"),
+                ("plugins", "allow_plugins"),
+            ]
+            for token, key in mapping:
+                if self._runtime_cfg.get(key, False):
+                    selected.append(token)
+        else:
+            selected = list(selected_tokens)
         args = ["python", POLYGLOT_SETUP_SCRIPT, "--write-config", POLYGLOT_RUNTIME_CONFIG]
         if selected:
             args += ["--languages", ",".join(selected)]
@@ -2457,10 +2471,110 @@ class App:
         state = self._load_app_state()
         if state.get("first_launch_completed"):
             return
-        self.open_installation_guide()
+        self.open_first_time_setup_wizard()
         state["first_launch_completed"] = True
         state["first_launch_shown_at"] = datetime.now().isoformat(timespec="seconds")
         self._save_app_state(state)
+
+    def open_first_time_setup_wizard(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - First Time Setup")
+        win.geometry("760x420")
+        win.configure(bg=DARK_BG)
+        win.minsize(620, 360)
+        win.grab_set()
+
+        tk.Label(
+            win,
+            text="First Time Setup Wizard",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 14, "bold"),
+            pady=12,
+        ).pack(fill="x")
+
+        tk.Label(
+            win,
+            text="Select target platform profile (for installer/config guidance):",
+            bg=DARK_BG,
+            fg=PANEL_FG,
+            font=("Consolas", 10),
+            pady=6,
+        ).pack(fill="x")
+
+        os_var = tk.StringVar(value="Windows 11")
+        os_options = [
+            "Windows 11",
+            "Debian Linux",
+            "macOS Sonoma",
+            "macOS Sequoia",
+            "macOS Tahoe",
+        ]
+        combo = ttk.Combobox(win, textvariable=os_var, values=os_options, state="readonly", font=("Consolas", 10))
+        combo.pack(fill="x", padx=14, pady=6)
+
+        details = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 9),
+            height=10,
+            padx=10,
+            pady=10,
+        )
+        details.pack(fill="both", expand=True, padx=14, pady=(6, 10))
+        details.insert(
+            "1.0",
+            "This wizard applies recommended language/runtime settings and opens installation guidance.\n"
+            "It is designed for non-developer onboarding.\n\n"
+            "Next steps after Apply:\n"
+            "1) Runtime config is created for selected OS profile\n"
+            "2) Installation guide opens with beginner-friendly instructions\n"
+            "3) Plugin manager remains available for one-click enable/disable\n",
+        )
+        details.config(state="disabled")
+
+        btn_bar = tk.Frame(win, bg=DARK_BG)
+        btn_bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        def apply_setup():
+            choice = os_var.get()
+            langs = self._recommended_languages_for_os(choice)
+            self.open_polyglot_setup(selected_tokens=langs)
+            self.open_installation_guide()
+            self._set_status(f"First-time setup applied for {choice}")
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        tk.Button(
+            btn_bar,
+            text="Apply Setup",
+            command=apply_setup,
+            bg=ACCENT,
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            btn_bar,
+            text="Skip",
+            command=win.destroy,
+            bg="#3e4f74",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=8)
 
     def open_installation_guide(self):
         win = tk.Toplevel(self.root)
