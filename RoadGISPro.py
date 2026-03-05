@@ -42,6 +42,10 @@ RUST_VALIDATOR_MANIFEST = os.path.join(POLYGLOT_DIR, "validators", "rust_validat
 POLYGLOT_RUNTIME_CONFIG = os.path.join(POLYGLOT_DIR, "runtime_config.json")
 POLYGLOT_SETUP_SCRIPT = os.path.join(POLYGLOT_DIR, "setup", "setup_languages.py")
 APP_LOG_PATH = os.path.join(BASE_DIR, "roadgis.log")
+APP_STATE_PATH = os.path.join(BASE_DIR, ".roadgis_state.json")
+PLUGIN_FRAMEWORK_PATH = os.path.abspath(
+    os.path.join(BASE_DIR, "..", "..", "..", "Frameworks", "RoadGIS-Plugin-Framework")
+)
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -394,6 +398,7 @@ class App:
         self._build_statusbar()
         self._bind_keys()
         self.redraw()
+        self.root.after(200, self._maybe_show_first_launch_guide)
 
     def _build_menu(self):
         mb = tk.Menu(
@@ -455,6 +460,8 @@ class App:
             ("Validate Layer File", self.validate_layer_file_dialog),
             ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
             ("Polyglot Setup (OS/Languages)", self.open_polyglot_setup),
+            ("Open Installation Guide", self.open_installation_guide),
+            ("Build Installers", self.open_installer_builder_info),
         ])
 
         menu("Plugins", [
@@ -2421,6 +2428,153 @@ class App:
             self._set_status(f"Polyglot setup applied for {platform.system()}")
             return
         messagebox.showwarning("Polyglot Setup", "Setup script did not return valid JSON. Check roadgis.log.")
+
+    def _load_app_state(self):
+        state = {
+            "first_launch_completed": False,
+            "first_launch_shown_at": None,
+        }
+        if os.path.exists(APP_STATE_PATH):
+            try:
+                with open(APP_STATE_PATH, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    for k in state:
+                        if k in raw:
+                            state[k] = raw[k]
+            except (OSError, json.JSONDecodeError) as ex:
+                self._log_exception("Failed to load app state", ex, context=APP_STATE_PATH)
+        return state
+
+    def _save_app_state(self, state):
+        try:
+            with open(APP_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except OSError as ex:
+            self._log_exception("Failed to save app state", ex, context=APP_STATE_PATH)
+
+    def _maybe_show_first_launch_guide(self):
+        state = self._load_app_state()
+        if state.get("first_launch_completed"):
+            return
+        self.open_installation_guide()
+        state["first_launch_completed"] = True
+        state["first_launch_shown_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_app_state(state)
+
+    def open_installation_guide(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Installation Guide")
+        win.geometry("980x680")
+        win.configure(bg=DARK_BG)
+        win.minsize(760, 520)
+
+        title = tk.Label(
+            win,
+            text="RoadGIS Installation and Onboarding Guide",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        )
+        title.pack(side="top", fill="x")
+
+        text = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            insertbackground=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 10),
+            padx=12,
+            pady=12,
+        )
+        text.pack(side="top", fill="both", expand=True, padx=12, pady=(0, 10))
+
+        guide = f"""Welcome to RoadGIS Pro.
+
+This guide appears on first launch and can always be reopened from:
+Tools > Open Installation Guide
+
+1) Recommended first steps
+- Open Tools > Polyglot Setup (OS/Languages)
+- Select language engines you want enabled
+- Install built-in plugins via Plugins > Install Built-in Plugins
+- Open Plugins > Plugin Manager and enable desired plugins
+
+2) Where plugin framework lives
+- Framework path: {PLUGIN_FRAMEWORK_PATH}
+- Clone/share this framework so contributors can build Go/Rust plugins quickly.
+
+3) Platform installer targets
+- Windows 11: .exe and .msi
+- Debian Linux: .deb
+- macOS Sonoma/Sequoia/Tahoe: signed app/pkg workflow
+
+4) Build installer helper
+- Use Tools > Build Installers for platform-specific commands.
+
+5) Diagnostics
+- Runtime config: {POLYGLOT_RUNTIME_CONFIG}
+- App log: {APP_LOG_PATH}
+- Plugin registry: {PLUGIN_REGISTRY_PATH}
+"""
+        text.insert("1.0", guide)
+        text.config(state="disabled")
+
+        btn_bar = tk.Frame(win, bg=DARK_BG)
+        btn_bar.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
+        tk.Button(
+            btn_bar,
+            text="Open Polyglot Setup",
+            command=self.open_polyglot_setup,
+            bg=ACCENT,
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=(0, 6))
+        tk.Button(
+            btn_bar,
+            text="Plugin Manager",
+            command=self.open_plugin_manager,
+            bg="#4a6aa0",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=6)
+        tk.Button(
+            btn_bar,
+            text="Build Installers",
+            command=self.open_installer_builder_info,
+            bg="#3f8b5f",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=6)
+
+    def open_installer_builder_info(self):
+        packaging_dir = os.path.join(PLUGIN_FRAMEWORK_PATH, "packaging")
+        msg = (
+            "Installer build scripts are in the plugin framework packaging folder:\n\n"
+            f"{packaging_dir}\n\n"
+            "Targets:\n"
+            "- Windows 11: .exe and .msi workflow scripts\n"
+            "- Debian Linux: .deb workflow script\n"
+            "- macOS Sonoma/Sequoia/Tahoe: app/pkg workflow script\n\n"
+            "Run the relevant script for your OS in a terminal."
+        )
+        messagebox.showinfo("Build Installers", msg)
 
     def _default_plugin_manifests(self):
         if not os.path.isdir(PLUGIN_MANIFESTS_DIR):

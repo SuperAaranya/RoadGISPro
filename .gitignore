@@ -1,3 +1,4 @@
 roadgis.log
+.roadgis_state.json
 polyglot/runtime_config.json
 __pycache__/
