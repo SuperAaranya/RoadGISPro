@@ -13,6 +13,9 @@ import heapq
 import time
 import shutil
 import subprocess
+import traceback
+import platform
+from datetime import datetime
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -29,11 +32,16 @@ RUST_ROUTER_BIN = os.path.join(
 JS_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "js", "metrics.js")
 GO_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "go", "metrics.go")
 CSHARP_METRICS_PROJECT = os.path.join(POLYGLOT_DIR, "csharp", "MetricsEngine.csproj")
+RUBY_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "ruby", "metrics.rb")
+JAVA_METRICS_SOURCE = os.path.join(POLYGLOT_DIR, "java", "MetricsEngine.java")
 PLUGIN_DIR = os.path.join(POLYGLOT_DIR, "plugins")
 PLUGIN_REGISTRY_PATH = os.path.join(PLUGIN_DIR, "registry.json")
 PLUGIN_MANIFESTS_DIR = os.path.join(PLUGIN_DIR, "manifests")
 GO_VALIDATOR_SCRIPT = os.path.join(POLYGLOT_DIR, "validators", "go_validator", "validator.go")
 RUST_VALIDATOR_MANIFEST = os.path.join(POLYGLOT_DIR, "validators", "rust_validator", "Cargo.toml")
+POLYGLOT_RUNTIME_CONFIG = os.path.join(POLYGLOT_DIR, "runtime_config.json")
+POLYGLOT_SETUP_SCRIPT = os.path.join(POLYGLOT_DIR, "setup", "setup_languages.py")
+APP_LOG_PATH = os.path.join(BASE_DIR, "roadgis.log")
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -372,6 +380,7 @@ class App:
         self._drive_speed   = 0.0
         self._plugins       = []
         self._plugin_manager_win = None
+        self._runtime_cfg = self._load_runtime_config()
 
         root.title(APP_TITLE)
         root.configure(bg=DARK_BG)
@@ -445,6 +454,7 @@ class App:
         menu("Tools", [
             ("Validate Layer File", self.validate_layer_file_dialog),
             ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
+            ("Polyglot Setup (OS/Languages)", self.open_polyglot_setup),
         ])
 
         menu("Plugins", [
@@ -1742,11 +1752,12 @@ class App:
         path.reverse()
         return path, dist[end]
 
-    def _run_json_process(self, cmd, payload, timeout=8):
+    def _run_json_process(self, cmd, payload, timeout=8, input_mode="json"):
         try:
+            input_data = json.dumps(payload) if input_mode == "json" else ""
             proc = subprocess.run(
                 cmd,
-                input=json.dumps(payload),
+                input=input_data,
                 text=True,
                 capture_output=True,
                 check=True,
@@ -1754,13 +1765,17 @@ class App:
             )
             raw = proc.stdout.strip()
             if not raw:
+                self._log("WARN", "Empty process output", context=" ".join(cmd))
                 return None
             return json.loads(raw)
-        except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError):
+        except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as ex:
+            self._log_exception("External process failed", ex, context=" ".join(cmd))
             return None
 
     def _shortest_time_path_polyglot(self, start, end):
         if start not in self.graph or end not in self.graph:
+            return None, None
+        if not self._runtime_cfg.get("allow_rust_router", True):
             return None, None
         adjacency = []
         for node, edges in self.graph.items():
@@ -2320,6 +2335,93 @@ class App:
             self.redraw()
             self._set_status("Layer cleared")
 
+    def _log(self, level, message, context=None):
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ctx = f" | {context}" if context else ""
+        line = f"[{stamp}] [{level}] {message}{ctx}\n"
+        try:
+            with open(APP_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+    def _log_exception(self, message, ex=None, context=None):
+        detail = f"{message}: {ex}" if ex is not None else message
+        self._log("ERROR", detail, context=context)
+        if ex is not None:
+            try:
+                tb = traceback.format_exc()
+                self._log("ERROR", tb.rstrip(), context="traceback")
+            except Exception:
+                pass
+
+    def _runtime_defaults(self):
+        return {
+            "allow_rust_router": True,
+            "allow_javascript_metrics": True,
+            "allow_go_metrics": True,
+            "allow_csharp_metrics": True,
+            "allow_ruby_metrics": False,
+            "allow_java_metrics": False,
+            "allow_rust_validator": True,
+            "allow_go_validator": True,
+            "allow_plugins": True,
+        }
+
+    def _load_runtime_config(self):
+        cfg = self._runtime_defaults()
+        if os.path.exists(POLYGLOT_RUNTIME_CONFIG):
+            try:
+                with open(POLYGLOT_RUNTIME_CONFIG, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    for k in cfg:
+                        if k in loaded:
+                            cfg[k] = bool(loaded[k])
+            except (OSError, json.JSONDecodeError) as ex:
+                self._log_exception("Failed to load runtime config", ex, context=POLYGLOT_RUNTIME_CONFIG)
+        return cfg
+
+    def _save_runtime_config(self):
+        os.makedirs(POLYGLOT_DIR, exist_ok=True)
+        try:
+            with open(POLYGLOT_RUNTIME_CONFIG, "w", encoding="utf-8") as f:
+                json.dump(self._runtime_cfg, f, indent=2)
+        except OSError as ex:
+            self._log_exception("Failed to save runtime config", ex, context=POLYGLOT_RUNTIME_CONFIG)
+
+    def open_polyglot_setup(self):
+        if not os.path.exists(POLYGLOT_SETUP_SCRIPT):
+            messagebox.showerror("Polyglot Setup", f"Setup script not found:\n{POLYGLOT_SETUP_SCRIPT}")
+            return
+        selected = []
+        mapping = [
+            ("rust_router", "allow_rust_router"),
+            ("js_metrics", "allow_javascript_metrics"),
+            ("go_metrics", "allow_go_metrics"),
+            ("csharp_metrics", "allow_csharp_metrics"),
+            ("ruby_metrics", "allow_ruby_metrics"),
+            ("java_metrics", "allow_java_metrics"),
+            ("rust_validator", "allow_rust_validator"),
+            ("go_validator", "allow_go_validator"),
+            ("plugins", "allow_plugins"),
+        ]
+        for token, key in mapping:
+            if self._runtime_cfg.get(key, False):
+                selected.append(token)
+        args = ["python", POLYGLOT_SETUP_SCRIPT, "--write-config", POLYGLOT_RUNTIME_CONFIG]
+        if selected:
+            args += ["--languages", ",".join(selected)]
+        out = self._run_json_process(args, payload={}, timeout=25, input_mode="args")
+        if isinstance(out, dict):
+            cfg = out.get("config")
+            if isinstance(cfg, dict):
+                self._runtime_cfg = {**self._runtime_defaults(), **{k: bool(v) for k, v in cfg.items() if k in self._runtime_defaults()}}
+                self._save_runtime_config()
+            self._set_status(f"Polyglot setup applied for {platform.system()}")
+            return
+        messagebox.showwarning("Polyglot Setup", "Setup script did not return valid JSON. Check roadgis.log.")
+
     def _default_plugin_manifests(self):
         if not os.path.isdir(PLUGIN_MANIFESTS_DIR):
             return []
@@ -2587,6 +2689,8 @@ class App:
         return out
 
     def _run_plugins_for_hook(self, hook, payload):
+        if not self._runtime_cfg.get("allow_plugins", True):
+            return [], [{"plugin_id": "plugins-disabled", "plugin_name": "Plugins Disabled", "error": "Plugins disabled in runtime config"}]
         outputs = []
         errors = []
         for plugin in self._plugins:
@@ -2663,9 +2767,9 @@ class App:
 
     def _validate_payload_polyglot(self, payload):
         validators = []
-        if os.path.exists(RUST_VALIDATOR_MANIFEST) and shutil.which("cargo"):
+        if self._runtime_cfg.get("allow_rust_validator", True) and os.path.exists(RUST_VALIDATOR_MANIFEST) and shutil.which("cargo"):
             validators.append(("rust-validator", ["cargo", "run", "--quiet", "--release", "--manifest-path", RUST_VALIDATOR_MANIFEST], 20))
-        if os.path.exists(GO_VALIDATOR_SCRIPT) and shutil.which("go"):
+        if self._runtime_cfg.get("allow_go_validator", True) and os.path.exists(GO_VALIDATOR_SCRIPT) and shutil.which("go"):
             validators.append(("go-validator", ["go", "run", GO_VALIDATOR_SCRIPT], 12))
         for engine, cmd, timeout in validators:
             out = self._run_json_process(cmd, payload, timeout=timeout)
@@ -2847,12 +2951,16 @@ class App:
 
     def _compute_metrics_polyglot(self, payload):
         engines = []
-        if os.path.exists(JS_METRICS_SCRIPT) and shutil.which("node"):
+        if self._runtime_cfg.get("allow_javascript_metrics", True) and os.path.exists(JS_METRICS_SCRIPT) and shutil.which("node"):
             engines.append(("javascript", ["node", JS_METRICS_SCRIPT], 8))
-        if os.path.exists(GO_METRICS_SCRIPT) and shutil.which("go"):
+        if self._runtime_cfg.get("allow_go_metrics", True) and os.path.exists(GO_METRICS_SCRIPT) and shutil.which("go"):
             engines.append(("go", ["go", "run", GO_METRICS_SCRIPT], 10))
-        if os.path.exists(CSHARP_METRICS_PROJECT) and shutil.which("dotnet"):
+        if self._runtime_cfg.get("allow_csharp_metrics", True) and os.path.exists(CSHARP_METRICS_PROJECT) and shutil.which("dotnet"):
             engines.append(("csharp", ["dotnet", "run", "--project", CSHARP_METRICS_PROJECT, "-c", "Release"], 20))
+        if self._runtime_cfg.get("allow_ruby_metrics", True) and os.path.exists(RUBY_METRICS_SCRIPT) and shutil.which("ruby"):
+            engines.append(("ruby", ["ruby", RUBY_METRICS_SCRIPT], 8))
+        if self._runtime_cfg.get("allow_java_metrics", True) and os.path.exists(JAVA_METRICS_SOURCE) and shutil.which("java"):
+            engines.append(("java", ["java", JAVA_METRICS_SOURCE], 12))
         for engine_name, cmd, timeout in engines:
             out = self._run_json_process(cmd, payload, timeout=timeout)
             if isinstance(out, dict):

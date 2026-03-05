@@ -6,8 +6,11 @@ This folder adds optional cross-platform engines:
 - `js/metrics.js`: export analytics engine in JavaScript (Node.js)
 - `go/metrics.go`: export analytics engine in Go
 - `csharp/`: export analytics engine in C# (.NET)
+- `ruby/`: optional export analytics engine in Ruby
+- `java/`: optional export analytics engine in Java source mode
 - `plugins/`: installable plugin engines and manifests (Go + Rust samples)
 - `validators/`: file-format validators (Go + Rust)
+- `setup/`: cross-OS language selection setup scripts
 
 ## Why this exists
 
@@ -41,8 +44,45 @@ The app can invoke `dotnet run --project polyglot/csharp/MetricsEngine.csproj -c
 
 - Routing: Rust first, Python fallback
 - Metrics: JavaScript, then Go, then C#, then Python fallback
+- Optional Metrics: Ruby, Java (disabled by default in runtime config)
 - Plugins: enabled plugins run on `export_json` and manual runs
 - Validation: Rust validator, then Go validator, then Python checks
+
+## Cross-OS setup
+
+Generate `runtime_config.json` with selected languages/features:
+
+Windows PowerShell:
+
+```powershell
+.\polyglot\setup\setup_languages.ps1 -Languages "rust_router,js_metrics,go_metrics,csharp_metrics,rust_validator,go_validator,plugins"
+```
+
+Linux/macOS:
+
+```bash
+./polyglot/setup/setup_languages.sh "rust_router,js_metrics,go_metrics,csharp_metrics,rust_validator,go_validator,plugins"
+```
+
+Direct Python:
+
+```bash
+python polyglot/setup/setup_languages.py --languages "rust_router,js_metrics,go_metrics,csharp_metrics,rust_validator,go_validator,plugins" --write-config polyglot/runtime_config.json
+```
+
+You can also start from `polyglot/runtime_config.example.json`.
+
+Tokens available:
+
+- `rust_router`
+- `js_metrics`
+- `go_metrics`
+- `csharp_metrics`
+- `ruby_metrics`
+- `java_metrics`
+- `rust_validator`
+- `go_validator`
+- `plugins`
 
 ## Plugin Manager (QGIS-style workflow)
 

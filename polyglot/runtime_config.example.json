@@ -1,0 +1,11 @@
+{
+  "allow_rust_router": true,
+  "allow_javascript_metrics": true,
+  "allow_go_metrics": true,
+  "allow_csharp_metrics": true,
+  "allow_ruby_metrics": false,
+  "allow_java_metrics": false,
+  "allow_rust_validator": true,
+  "allow_go_validator": true,
+  "allow_plugins": true
+}
