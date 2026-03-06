@@ -1387,7 +1387,7 @@ class App:
                           capstyle="round", joinstyle="round", **dash_args)
 
             if r.surface in ("gravel", "dirt"):
-                c.create_line(*flat, width=max(1, width * 0.4), fill="#ffffff22",
+                c.create_line(*flat, width=max(1, width * 0.4), fill="#cfd6e6",
                               capstyle="round", joinstyle="round",
                               dash=(2, int(max(4, width * 2))))
 
