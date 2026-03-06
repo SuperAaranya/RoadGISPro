@@ -19,6 +19,8 @@ from datetime import datetime
 import urllib.parse
 import urllib.request
 import re
+import threading
+from queue import Queue, Empty
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -138,6 +140,8 @@ DRIVE_BRAKE = 270.0
 DRIVE_TURN_RATE = 2.4
 DRIVE_LOCK_DIST = 90.0
 DRIVE_HARD_LIMIT_DIST = 220.0
+DRIVE_LANE_WIDTH_M = 3.4
+DRIVE_MAX_LANE_OFFSET = 9.0
 
 MAP_BG      = "#1a2030"
 DARK_BG     = "#111520"
@@ -390,6 +394,12 @@ class App:
         self._drive_pos     = None
         self._drive_heading = 0.0
         self._drive_speed   = 0.0
+        self._drive_lane_offset = 0.0
+        self._drive_elev = 0.0
+        self._osm_job_thread = None
+        self._osm_cancel_event = None
+        self._osm_queue = None
+        self._osm_progress_win = None
         self._plugins       = []
         self._plugin_manager_win = None
         self._runtime_cfg = self._load_runtime_config()
@@ -2059,6 +2069,8 @@ class App:
         self._drive_pos = (spawn[0], spawn[1])
         self._drive_heading = spawn[2]
         self._drive_speed = 0.0
+        self._drive_lane_offset = 0.0
+        self._drive_elev = 0.0
         self._drive_keys = set()
 
         win = tk.Toplevel(self.root)
@@ -2099,6 +2111,8 @@ class App:
         self._drive_after_id = None
         self._drive_last_tick = None
         self._drive_keys = set()
+        self._drive_lane_offset = 0.0
+        self._drive_elev = 0.0
         if self._drive_win and self._drive_win.winfo_exists():
             try:
                 self._drive_win.destroy()
@@ -2139,17 +2153,31 @@ class App:
 
         nearest = self._nearest_segment_projection(nx, ny)
         if nearest:
-            sx, sy, seg_heading, _road, dist = nearest
+            sx, sy, seg_heading, seg_road, dist = nearest
             if dist <= DRIVE_LOCK_DIST:
                 snap = min(1.0, dt * (8.0 - 6.0 * (dist / max(DRIVE_LOCK_DIST, 1.0))))
-                nx = nx + (sx - nx) * snap
-                ny = ny + (sy - ny) * snap
+                road_lanes = max(1, int(getattr(seg_road, "lanes", 1)))
+                road_half_w = min(DRIVE_MAX_LANE_OFFSET, max(2.2, road_lanes * DRIVE_LANE_WIDTH_M * 0.5))
+                lane_shift = (1 if "d" in self._drive_keys else 0) - (1 if "a" in self._drive_keys else 0)
+                self._drive_lane_offset += lane_shift * road_half_w * 0.9 * dt
+                self._drive_lane_offset = max(-road_half_w, min(road_half_w, self._drive_lane_offset))
+                nx_road = -math.sin(seg_heading)
+                ny_road = math.cos(seg_heading)
+                target_x = sx + nx_road * self._drive_lane_offset
+                target_y = sy + ny_road * self._drive_lane_offset
+                nx = nx + (target_x - nx) * snap
+                ny = ny + (target_y - ny) * snap
                 align = min(1.0, dt * 2.5)
                 self._drive_heading = self._lerp_angle(self._drive_heading, seg_heading, align)
+                # Smooth camera elevation to produce ramp transitions between bridge levels.
+                target_elev = float(getattr(seg_road, "bridge_level", 0)) * 2.2
+                self._drive_elev += (target_elev - self._drive_elev) * min(1.0, dt * 2.0)
                 if dist > DRIVE_LOCK_DIST * 0.6:
                     self._drive_speed *= 0.97
             elif dist > DRIVE_HARD_LIMIT_DIST:
                 self._drive_speed *= 0.78
+        else:
+            self._drive_lane_offset *= max(0.0, 1.0 - dt * 1.4)
 
         self._drive_pos = (nx, ny)
         self._draw_drive_scene(nearest)
@@ -2175,6 +2203,7 @@ class App:
         near_plane = 3.0
         lane_width = 11.0
         seg_draw = []
+        sign_draw = []
 
         def proj(xc, zc, elev=0.0):
             scale = 760.0 / (zc + 70.0)
@@ -2227,6 +2256,9 @@ class App:
             r2x, r2y, _ = proj(xb + lane_width, zb, elev)
             depth = min(za, zb)
             seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev))
+            if 12.0 < depth < 220.0:
+                sx, sy, _ = proj(xa + lane_width + 3.5, za, elev + 1.0)
+                sign_draw.append((depth, sx, sy, int(max(10, getattr(road, "speed", 30)))))
 
         # Building massing from OSM structures.
         b_draw = []
@@ -2273,6 +2305,12 @@ class App:
             c.create_line(r1x, r1y, r2x, r2y, fill=road_col, width=2)
             c.create_line((l1x + r1x) * 0.5, (l1y + r1y) * 0.5, (l2x + r2x) * 0.5, (l2y + r2y) * 0.5,
                           fill="#d8d2aa", width=1, dash=(5, 6))
+
+        for _depth, sx, sy, speed_lim in sorted(sign_draw, key=lambda it: it[0], reverse=True):
+            pole_h = 18
+            c.create_line(sx, sy, sx, sy - pole_h, fill="#b0b8c8", width=2)
+            c.create_oval(sx - 10, sy - pole_h - 10, sx + 10, sy - pole_h + 10, fill="#ffffff", outline="#cc2222", width=2)
+            c.create_text(sx, sy - pole_h, text=str(speed_lim), fill="#202020", font=("Consolas", 7, "bold"))
 
         cx = w * 0.5
         base_y = h - 76
@@ -3244,136 +3282,228 @@ Tools > Open Installation Guide
             return
         if not self._ask_save():
             return
+        self._start_osm_download_job(area)
+
+    def _start_osm_download_job(self, area):
+        self._osm_cancel_event = threading.Event()
+        self._osm_queue = Queue()
         self._set_status(f"OSM download started for '{area}'")
-        self.root.update_idletasks()
+
+        def worker():
+            try:
+                payload = self._download_osm_payload(area, self._osm_cancel_event, self._osm_queue)
+                if self._osm_cancel_event.is_set():
+                    self._osm_queue.put(("cancelled", area, None))
+                else:
+                    self._osm_queue.put(("done", area, payload))
+            except Exception as ex:
+                self._osm_queue.put(("error", area, str(ex)))
+
+        self._osm_job_thread = threading.Thread(target=worker, daemon=True)
+        self._osm_job_thread.start()
+        self._open_osm_progress_window(area)
+        self.root.after(120, self._poll_osm_job)
+
+    def _open_osm_progress_window(self, area):
+        if self._osm_progress_win and self._osm_progress_win.winfo_exists():
+            try:
+                self._osm_progress_win.destroy()
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.root)
+        win.title("OSM Download")
+        win.geometry("520x160")
+        win.configure(bg=DARK_BG)
+        win.minsize(420, 140)
+        self._osm_progress_win = win
+        tk.Label(win, text=f"Downloading OSM area: {area}", bg=DARK_BG, fg=ACCENT,
+                 font=("Consolas", 11, "bold"), pady=8).pack(fill="x")
+        self._osm_progress_var = tk.StringVar(value="Starting...")
+        tk.Label(win, textvariable=self._osm_progress_var, bg=DARK_BG, fg=PANEL_FG,
+                 font=("Consolas", 10)).pack(fill="x", padx=12, pady=8)
+        tk.Button(
+            win,
+            text="Cancel",
+            command=lambda: self._osm_cancel_event.set() if self._osm_cancel_event else None,
+            bg=ACCENT2,
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(pady=6)
+
+    def _poll_osm_job(self):
+        if not self._osm_queue:
+            return
         try:
-            geo = self._osm_request_json(
-                NOMINATIM_URL,
-                params={"q": area, "format": "jsonv2", "limit": 1},
-                method="GET",
-            )
-            if not isinstance(geo, list) or not geo:
-                messagebox.showerror("OSM Mode", f"Area not found: {area}")
-                return
-            hit = geo[0]
-            bbox = hit.get("boundingbox")
-            if not isinstance(bbox, list) or len(bbox) != 4:
-                messagebox.showerror("OSM Mode", f"No bounding box available for: {area}")
-                return
-            south, north, west, east = [self._parse_num(v, 0.0) for v in bbox]
-            overpass_query = (
-                "[out:json][timeout:60];("
-                f'way["highway"]({south},{west},{north},{east});'
-                f'way["building"]({south},{west},{north},{east});'
-                ");(._;>;);out body;"
-            )
-            osm = self._osm_request_json(OVERPASS_URL, params={"data": overpass_query}, method="POST")
-            elements = osm.get("elements", []) if isinstance(osm, dict) else []
-            nodes = {}
-            ways = []
-            for el in elements:
-                if not isinstance(el, dict):
+            while True:
+                msg = self._osm_queue.get_nowait()
+                kind = msg[0]
+                if kind == "progress" and self._osm_progress_win and self._osm_progress_win.winfo_exists():
+                    self._osm_progress_var.set(msg[1])
+                elif kind == "done":
+                    _kind, area, payload = msg
+                    self._finish_osm_job()
+                    self._apply_payload_to_layer(payload, f"OSM: {area}", mark_dirty=True)
+                    roads_n = len(payload.get("roads", []))
+                    b_n = len(payload.get("structures", []))
+                    self._set_status(f"OSM area loaded: {area} | roads={roads_n} buildings={b_n}")
+                    if messagebox.askyesno("Save Offline Copy", "Do you want to save this OSM area offline now?"):
+                        suggested = self._suggest_name(area) + FILE_EXT
+                        path = filedialog.asksaveasfilename(
+                            defaultextension=FILE_EXT,
+                            initialfile=suggested,
+                            filetypes=[("RoadGIS Layer", f"*{FILE_EXT}"), ("All Files", "*.*")],
+                            title="Save OSM Offline Layer",
+                        )
+                        if path:
+                            self.file = path
+                            self._write_file(path)
+                    return
+                elif kind == "error":
+                    _kind, area, err = msg
+                    self._finish_osm_job()
+                    self._log("ERROR", f"OSM download failed: {err}", context=area)
+                    messagebox.showerror("OSM Mode", f"Failed to download/import OSM data:\n{err}")
+                    return
+                elif kind == "cancelled":
+                    self._finish_osm_job()
+                    self._set_status("OSM download cancelled")
+                    return
+        except Empty:
+            pass
+        if self._osm_job_thread and self._osm_job_thread.is_alive():
+            self.root.after(120, self._poll_osm_job)
+        else:
+            self._finish_osm_job()
+
+    def _finish_osm_job(self):
+        if self._osm_progress_win and self._osm_progress_win.winfo_exists():
+            try:
+                self._osm_progress_win.destroy()
+            except tk.TclError:
+                pass
+        self._osm_progress_win = None
+        self._osm_queue = None
+        self._osm_job_thread = None
+        self._osm_cancel_event = None
+
+    def _download_osm_payload(self, area, cancel_event, progress_q):
+        progress_q.put(("progress", "Geocoding area..."))
+        geo = self._osm_request_json(
+            NOMINATIM_URL,
+            params={"q": area, "format": "jsonv2", "limit": 1},
+            method="GET",
+        )
+        if cancel_event.is_set():
+            return {}
+        if not isinstance(geo, list) or not geo:
+            raise ValueError(f"Area not found: {area}")
+        hit = geo[0]
+        bbox = hit.get("boundingbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise ValueError(f"No bounding box available for: {area}")
+        south, north, west, east = [self._parse_num(v, 0.0) for v in bbox]
+        progress_q.put(("progress", "Downloading roads/buildings from Overpass..."))
+        overpass_query = (
+            "[out:json][timeout:80];("
+            f'way["highway"]({south},{west},{north},{east});'
+            f'way["building"]({south},{west},{north},{east});'
+            ");(._;>;);out body;"
+        )
+        osm = self._osm_request_json(OVERPASS_URL, params={"data": overpass_query}, method="POST")
+        if cancel_event.is_set():
+            return {}
+        elements = osm.get("elements", []) if isinstance(osm, dict) else []
+        nodes = {}
+        ways = []
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            et = el.get("type")
+            if et == "node":
+                nodes[el.get("id")] = (self._parse_num(el.get("lon")), self._parse_num(el.get("lat")))
+            elif et == "way":
+                ways.append(el)
+        if not nodes:
+            raise ValueError("No OSM node data returned for this area.")
+
+        mean_lat = sum(v[1] for v in nodes.values()) / max(1, len(nodes))
+        mean_lon = sum(v[0] for v in nodes.values()) / max(1, len(nodes))
+        cos_lat = max(0.2, math.cos(math.radians(mean_lat)))
+
+        def world_xy(lon, lat):
+            x = (lon - mean_lon) * 111_320.0 * cos_lat
+            y = (lat - mean_lat) * 110_540.0
+            return [x, -y]
+
+        hwy_map = {
+            "motorway": "motorway", "trunk": "motorway", "primary": "primary",
+            "secondary": "secondary", "tertiary": "tertiary",
+            "residential": "residential", "service": "service",
+            "unclassified": "unclassified", "motorway_link": "service", "trunk_link": "service",
+            "primary_link": "service", "secondary_link": "service", "tertiary_link": "service",
+        }
+        default_speed = {
+            "motorway": 110, "primary": 80, "secondary": 60,
+            "tertiary": 50, "residential": 35, "service": 25, "unclassified": 45,
+        }
+        roads = []
+        structures = []
+        progress_q.put(("progress", "Parsing OSM objects..."))
+        for way in ways:
+            if cancel_event.is_set():
+                return {}
+            tags = way.get("tags", {}) if isinstance(way.get("tags"), dict) else {}
+            refs = way.get("nodes", [])
+            if not isinstance(refs, list):
+                continue
+            geom = []
+            for nid in refs:
+                if nid not in nodes:
                     continue
-                et = el.get("type")
-                if et == "node":
-                    nodes[el.get("id")] = (self._parse_num(el.get("lon")), self._parse_num(el.get("lat")))
-                elif et == "way":
-                    ways.append(el)
-
-            if not nodes:
-                messagebox.showerror("OSM Mode", "No OSM node data returned for this area.")
-                return
-
-            mean_lat = sum(v[1] for v in nodes.values()) / max(1, len(nodes))
-            mean_lon = sum(v[0] for v in nodes.values()) / max(1, len(nodes))
-            cos_lat = max(0.2, math.cos(math.radians(mean_lat)))
-
-            def world_xy(lon, lat):
-                x = (lon - mean_lon) * 111_320.0 * cos_lat
-                y = (lat - mean_lat) * 110_540.0
-                return [x, -y]
-
-            hwy_map = {
-                "motorway": "motorway", "trunk": "motorway", "primary": "primary",
-                "secondary": "secondary", "tertiary": "tertiary",
-                "residential": "residential", "service": "service",
-                "unclassified": "unclassified", "motorway_link": "service", "trunk_link": "service",
-                "primary_link": "service", "secondary_link": "service", "tertiary_link": "service",
-            }
-            default_speed = {
-                "motorway": 110, "primary": 80, "secondary": 60,
-                "tertiary": 50, "residential": 35, "service": 25, "unclassified": 45,
-            }
-            roads = []
-            structures = []
-            for way in ways:
-                tags = way.get("tags", {}) if isinstance(way.get("tags"), dict) else {}
-                refs = way.get("nodes", [])
-                if not isinstance(refs, list):
-                    continue
-                geom = []
-                for nid in refs:
-                    if nid not in nodes:
-                        continue
-                    lon, lat = nodes[nid]
-                    geom.append(world_xy(lon, lat))
-                if len(geom) < 2:
-                    continue
-                if "highway" in tags:
-                    osm_type = str(tags.get("highway", "unclassified"))
-                    rtype = hwy_map.get(osm_type, "unclassified")
-                    speed = int(max(10, self._parse_num(tags.get("maxspeed"), default_speed.get(rtype, 45))))
-                    lanes = int(max(1, self._parse_num(tags.get("lanes"), 2)))
-                    bridge_level = int(self._parse_num(tags.get("layer"), 0))
-                    if as_bool(tags.get("bridge", False)) and bridge_level <= 0:
-                        bridge_level = 1
-                    road = Road(
-                        name=str(tags.get("name", tags.get("ref", f"{osm_type} road"))),
-                        rtype=rtype,
-                        speed=speed,
-                        lanes=lanes,
-                        oneway=as_bool(tags.get("oneway", False)),
-                        geom=geom,
-                        ref=str(tags.get("ref", "")),
-                        bridge_level=bridge_level,
-                        tunnel=as_bool(tags.get("tunnel", False)),
-                        surface=str(tags.get("surface", "asphalt")),
-                        max_weight=self._parse_num(tags.get("maxweight"), 0.0),
-                        lit=as_bool(tags.get("lit", False)),
-                    )
-                    roads.append(road.to_dict())
-                elif "building" in tags and len(geom) >= 3:
-                    levels = self._parse_num(tags.get("building:levels"), 2)
-                    height = self._parse_num(tags.get("height"), max(6.0, levels * 3.2))
-                    if geom[0] != geom[-1]:
-                        geom.append(list(geom[0]))
-                    structures.append({
-                        "name": str(tags.get("name", "building")),
-                        "footprint": geom,
-                        "height": max(4.0, float(height)),
-                    })
-
-            if not roads:
-                messagebox.showwarning("OSM Mode", "No roads found in selected area.")
-                return
-            payload = {"roads": roads, "connectors": [], "structures": structures}
-            self._apply_payload_to_layer(payload, f"OSM: {area}", mark_dirty=True)
-            self._set_status(f"OSM area loaded: {area} | roads={len(roads)} buildings={len(structures)}")
-
-            if messagebox.askyesno("Save Offline Copy", "Do you want to save this OSM area offline now?"):
-                suggested = self._suggest_name(area) + FILE_EXT
-                path = filedialog.asksaveasfilename(
-                    defaultextension=FILE_EXT,
-                    initialfile=suggested,
-                    filetypes=[("RoadGIS Layer", f"*{FILE_EXT}"), ("All Files", "*.*")],
-                    title="Save OSM Offline Layer",
+                lon, lat = nodes[nid]
+                geom.append(world_xy(lon, lat))
+            if len(geom) < 2:
+                continue
+            if "highway" in tags:
+                osm_type = str(tags.get("highway", "unclassified"))
+                rtype = hwy_map.get(osm_type, "unclassified")
+                speed = int(max(10, self._parse_num(tags.get("maxspeed"), default_speed.get(rtype, 45))))
+                lanes = int(max(1, self._parse_num(tags.get("lanes"), 2)))
+                bridge_level = int(self._parse_num(tags.get("layer"), 0))
+                if as_bool(tags.get("bridge", False)) and bridge_level <= 0:
+                    bridge_level = 1
+                road = Road(
+                    name=str(tags.get("name", tags.get("ref", f"{osm_type} road"))),
+                    rtype=rtype,
+                    speed=speed,
+                    lanes=lanes,
+                    oneway=as_bool(tags.get("oneway", False)),
+                    geom=geom,
+                    ref=str(tags.get("ref", "")),
+                    bridge_level=bridge_level,
+                    tunnel=as_bool(tags.get("tunnel", False)),
+                    surface=str(tags.get("surface", "asphalt")),
+                    max_weight=self._parse_num(tags.get("maxweight"), 0.0),
+                    lit=as_bool(tags.get("lit", False)),
                 )
-                if path:
-                    self.file = path
-                    self._write_file(path)
-        except Exception as ex:
-            self._log_exception("OSM download failed", ex, context=area)
-            messagebox.showerror("OSM Mode", f"Failed to download/import OSM data:\n{ex}")
+                roads.append(road.to_dict())
+            elif "building" in tags and len(geom) >= 3:
+                levels = self._parse_num(tags.get("building:levels"), 2)
+                height = self._parse_num(tags.get("height"), max(6.0, levels * 3.2))
+                if geom[0] != geom[-1]:
+                    geom.append(list(geom[0]))
+                structures.append({
+                    "name": str(tags.get("name", "building")),
+                    "footprint": geom,
+                    "height": max(4.0, float(height)),
+                })
+        if not roads:
+            raise ValueError("No roads found in selected area.")
+        return {"roads": roads, "connectors": [], "structures": structures}
 
     def save(self):
         if not self.file:
