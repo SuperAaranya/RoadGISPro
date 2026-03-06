@@ -53,6 +53,7 @@ PLUGIN_FRAMEWORK_PATH = os.path.abspath(
 )
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_FALLBACK_URL = "https://overpass.kumi.systems/api/interpreter"
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -3214,7 +3215,7 @@ Tools > Open Installation Guide
             messagebox.showinfo("Validation Result", "File is valid.")
             self._set_status("Validation passed")
 
-    def _osm_request_json(self, url, params=None, method="GET"):
+    def _osm_request_json(self, url, params=None, method="GET", timeout=60):
         headers = {
             "User-Agent": "RoadGISPro/1.0 (offline analysis mode)",
             "Accept": "application/json",
@@ -3223,12 +3224,36 @@ Tools > Open Installation Guide
             query = urllib.parse.urlencode(params or {})
             full = f"{url}?{query}" if query else url
             req = urllib.request.Request(full, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         data = urllib.parse.urlencode(params or {}).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def _query_overpass_with_fallback(self, overpass_query, progress_q, cancel_event, area_tag):
+        endpoints = [
+            ("primary", OVERPASS_URL),
+            ("kumi", OVERPASS_FALLBACK_URL),
+        ]
+        errors = []
+        for alias, endpoint in endpoints:
+            if cancel_event.is_set():
+                return None
+            host = urllib.parse.urlparse(endpoint).netloc
+            progress_q.put(("progress", f"Downloading {area_tag} via {alias} ({host})..."))
+            try:
+                osm = self._osm_request_json(endpoint, params={"data": overpass_query}, method="POST", timeout=90)
+                if isinstance(osm, dict) and isinstance(osm.get("elements"), list):
+                    return osm
+                errors.append(f"{alias}: invalid response payload")
+            except Exception as ex:
+                errors.append(f"{alias}: {ex}")
+        raise RuntimeError(
+            "All Overpass endpoints failed.\n"
+            + "\n".join(errors)
+            + "\nTip: wait 1-2 minutes and retry with a smaller area."
+        )
 
     def _parse_num(self, raw, default=0.0):
         try:
@@ -3391,29 +3416,35 @@ Tools > Open Installation Guide
         self._osm_cancel_event = None
 
     def _download_osm_payload(self, area, cancel_event, progress_q):
-        progress_q.put(("progress", "Geocoding area..."))
+        progress_q.put(("progress", f"Geocoding area '{area}'..."))
         geo = self._osm_request_json(
             NOMINATIM_URL,
             params={"q": area, "format": "jsonv2", "limit": 1},
             method="GET",
+            timeout=45,
         )
         if cancel_event.is_set():
             return {}
         if not isinstance(geo, list) or not geo:
             raise ValueError(f"Area not found: {area}")
         hit = geo[0]
+        osm_type = str(hit.get("osm_type", "area"))
+        osm_id = str(hit.get("osm_id", "?"))
+        area_tag = f"{osm_type} {osm_id}"
+        display_name = str(hit.get("display_name", area))
+        progress_q.put(("progress", f"Resolved area: {display_name} ({area_tag})"))
         bbox = hit.get("boundingbox")
         if not isinstance(bbox, list) or len(bbox) != 4:
             raise ValueError(f"No bounding box available for: {area}")
         south, north, west, east = [self._parse_num(v, 0.0) for v in bbox]
-        progress_q.put(("progress", "Downloading roads/buildings from Overpass..."))
+        progress_q.put(("progress", f"Preparing road/building query for {area_tag}..."))
         overpass_query = (
             "[out:json][timeout:80];("
             f'way["highway"]({south},{west},{north},{east});'
             f'way["building"]({south},{west},{north},{east});'
             ");(._;>;);out body;"
         )
-        osm = self._osm_request_json(OVERPASS_URL, params={"data": overpass_query}, method="POST")
+        osm = self._query_overpass_with_fallback(overpass_query, progress_q, cancel_event, area_tag)
         if cancel_event.is_set():
             return {}
         elements = osm.get("elements", []) if isinstance(osm, dict) else []
@@ -3452,10 +3483,12 @@ Tools > Open Installation Guide
         }
         roads = []
         structures = []
-        progress_q.put(("progress", "Parsing OSM objects..."))
-        for way in ways:
+        progress_q.put(("progress", f"Parsing OSM objects... ways={len(ways)}"))
+        for idx, way in enumerate(ways, start=1):
             if cancel_event.is_set():
                 return {}
+            if idx % 400 == 0:
+                progress_q.put(("progress", f"Parsing roads/buildings... {idx}/{len(ways)}"))
             tags = way.get("tags", {}) if isinstance(way.get("tags"), dict) else {}
             refs = way.get("nodes", [])
             if not isinstance(refs, list):
@@ -3503,6 +3536,7 @@ Tools > Open Installation Guide
                 })
         if not roads:
             raise ValueError("No roads found in selected area.")
+        progress_q.put(("progress", f"Completed parse: roads={len(roads)} buildings={len(structures)}"))
         return {"roads": roads, "connectors": [], "structures": structures}
 
     def save(self):
