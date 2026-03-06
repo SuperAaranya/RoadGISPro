@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
 import json
 import uuid
 import math
@@ -16,6 +16,9 @@ import subprocess
 import traceback
 import platform
 from datetime import datetime
+import urllib.parse
+import urllib.request
+import re
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -46,6 +49,8 @@ APP_STATE_PATH = os.path.join(BASE_DIR, ".roadgis_state.json")
 PLUGIN_FRAMEWORK_PATH = os.path.abspath(
     os.path.join(BASE_DIR, "..", "..", "..", "Frameworks", "RoadGIS-Plugin-Framework")
 )
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 
 def _derive_keystream(length: int) -> bytes:
@@ -102,6 +107,8 @@ def decode_rgis(raw: bytes):
         raise ValueError("Decoded data is not a valid RoadGIS layer object.")
     if "connectors" not in data or not isinstance(data["connectors"], list):
         data["connectors"] = []
+    if "structures" not in data or not isinstance(data["structures"], list):
+        data["structures"] = []
     return data
 
 
@@ -355,6 +362,7 @@ class App:
         self.graph      = {}
         self.mode       = "draw"
         self.connectors = []
+        self.structures = []
         self._pending_connector = None
         self.route_path = []
         self.route_start_node = None
@@ -425,6 +433,8 @@ class App:
             ("Open             Ctrl+O",       self.load),
             ("Save             Ctrl+S",       self.save),
             ("Save As          Ctrl+Shift+S", self.save_as),
+            None,
+            ("OSM Mode (Download Offline)",   self.open_osm_download_dialog),
             None,
             ("Export JSON",                   self.export_json),
             None,
@@ -1302,6 +1312,22 @@ class App:
         if self._show_grid:
             self._draw_grid()
 
+        # Draw imported OSM buildings/structures before roads.
+        for st in self.structures:
+            if not isinstance(st, dict):
+                continue
+            fp = st.get("footprint", [])
+            if not isinstance(fp, list) or len(fp) < 3:
+                continue
+            flat = []
+            for p in fp:
+                if not isinstance(p, (list, tuple)) or len(p) < 2:
+                    continue
+                sx, sy = self.screen(float(p[0]), float(p[1]))
+                flat.extend([sx, sy])
+            if len(flat) >= 6:
+                c.create_polygon(*flat, fill="#2f3f5a", outline="#51688d", width=1)
+
         road_order = sorted(
             self.roads.values(),
             key=lambda r: ROAD_STYLES.get(r.rtype, {}).get("width", 2),
@@ -1543,6 +1569,7 @@ class App:
         return copy.deepcopy({
             "roads": [r.to_dict() for r in self.roads.values()],
             "connectors": self.connectors,
+            "structures": self.structures,
         })
 
     def _push_undo(self):
@@ -1554,7 +1581,8 @@ class App:
     def _restore_snapshot(self, snapshot):
         self.roads    = {}
         self.connectors = []
-        payload = snapshot if isinstance(snapshot, dict) else {"roads": snapshot, "connectors": []}
+        self.structures = []
+        payload = snapshot if isinstance(snapshot, dict) else {"roads": snapshot, "connectors": [], "structures": []}
         self.selected = None
         self.drag_info = None
         for d in payload.get("roads", []):
@@ -1564,6 +1592,7 @@ class App:
                 continue
             self.roads[r.id] = r
         self.connectors = self._normalize_connectors(payload.get("connectors", []))
+        self.structures = payload.get("structures", []) if isinstance(payload.get("structures", []), list) else []
         self.build_graph()
         self._road_count_var.set(str(len(self.roads)))
         self._info_var.set("No feature selected")
@@ -2132,9 +2161,9 @@ class App:
         h = c.winfo_height() or 620
         c.delete("all")
 
-        horizon = h * 0.44
-        c.create_rectangle(0, 0, w, horizon, fill="#121a2c", outline="")
-        c.create_rectangle(0, horizon, w, h, fill="#1b1a18", outline="")
+        horizon = h * 0.42
+        c.create_rectangle(0, 0, w, horizon, fill="#142036", outline="")
+        c.create_rectangle(0, horizon, w, h, fill="#1c1f24", outline="")
 
         if self._drive_pos is None:
             return
@@ -2143,9 +2172,34 @@ class App:
         heading = self._drive_heading
         cos_h = math.cos(heading)
         sin_h = math.sin(heading)
-        near_plane = 4.0
-        lane_width = 10.0
+        near_plane = 3.0
+        lane_width = 11.0
         seg_draw = []
+
+        def proj(xc, zc, elev=0.0):
+            scale = 760.0 / (zc + 70.0)
+            sx = w * 0.5 + xc * scale
+            sy = horizon + 255.0 / (zc + 45.0) - elev * scale
+            return sx, sy, scale
+
+        def draw_building_box(cx, cz, width_world, height_world, depth=0.0, color="#476086"):
+            if cz <= near_plane:
+                return
+            left = cx - width_world * 0.5
+            right = cx + width_world * 0.5
+            front_z = cz
+            back_z = cz + max(5.0, depth)
+            blx, bly, _ = proj(left, front_z, 0.0)
+            brx, bry, _ = proj(right, front_z, 0.0)
+            tlx, tly, _ = proj(left, front_z, height_world)
+            trx, try_, _ = proj(right, front_z, height_world)
+            bblx, bbly, _ = proj(left, back_z, 0.0)
+            bbrx, bbry, _ = proj(right, back_z, 0.0)
+            btlx, btly, _ = proj(left, back_z, height_world)
+            btrx, btry, _ = proj(right, back_z, height_world)
+            c.create_polygon(blx, bly, brx, bry, trx, try_, tlx, tly, fill=color, outline="#243247")
+            c.create_polygon(brx, bry, bbrx, bbry, btrx, btry, trx, try_, fill="#394c6e", outline="#243247")
+            c.create_polygon(tlx, tly, trx, try_, btrx, btry, btlx, btly, fill="#5c7296", outline="#243247")
 
         for road, ax, ay, bx, by in self._iter_road_segments():
             dax = ax - px
@@ -2166,29 +2220,62 @@ class App:
                 else:
                     zb = near_plane
                     xb = xb + t * (xa - xb)
-
-            def proj(xc, zc):
-                scale = 760.0 / (zc + 70.0)
-                sx = w * 0.5 + xc * scale
-                sy = horizon + 255.0 / (zc + 45.0)
-                return sx, sy, scale
-
-            l1x, l1y, _ = proj(xa - lane_width, za)
-            r1x, r1y, _ = proj(xa + lane_width, za)
-            l2x, l2y, _ = proj(xb - lane_width, zb)
-            r2x, r2y, _ = proj(xb + lane_width, zb)
+            elev = max(-1.0, min(6.0, float(getattr(road, "bridge_level", 0)) * 2.2))
+            l1x, l1y, _ = proj(xa - lane_width, za, elev)
+            r1x, r1y, _ = proj(xa + lane_width, za, elev)
+            l2x, l2y, _ = proj(xb - lane_width, zb, elev)
+            r2x, r2y, _ = proj(xb + lane_width, zb, elev)
             depth = min(za, zb)
-            seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y))
+            seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev))
+
+        # Building massing from OSM structures.
+        b_draw = []
+        for st in self.structures:
+            if not isinstance(st, dict):
+                continue
+            fp = st.get("footprint", [])
+            if not isinstance(fp, list) or len(fp) < 3:
+                continue
+            pts = [p for p in fp if isinstance(p, (list, tuple)) and len(p) >= 2]
+            if len(pts) < 3:
+                continue
+            cx = sum(float(p[0]) for p in pts) / len(pts)
+            cy = sum(float(p[1]) for p in pts) / len(pts)
+            dx = cx - px
+            dy = cy - py
+            zc = cos_h * dx + sin_h * dy
+            xc = -sin_h * dx + cos_h * dy
+            if zc <= near_plane:
+                continue
+            width = max(8.0, min(40.0, math.sqrt(len(pts)) * 8.0))
+            depth = max(8.0, min(40.0, width * 0.9))
+            height = max(8.0, min(90.0, float(self._parse_num(st.get("height"), 18.0))))
+            b_draw.append((zc, xc, width, depth, height))
 
         seg_draw.sort(key=lambda it: it[0], reverse=True)
-        for _depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y in seg_draw:
+        b_draw.sort(key=lambda it: it[0], reverse=True)
+
+        for zc, xc, width, depth, height in b_draw:
+            draw_building_box(xc, zc, width, height, depth=depth, color="#4b6388")
+
+        for _depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev in seg_draw:
             road_col = ROAD_STYLES.get(road.rtype, {}).get("color", "#777")
-            c.create_polygon(l1x, l1y, r1x, r1y, r2x, r2y, l2x, l2y, fill="#2d2a27", outline="")
+            # Deck with ramp/elevation cues.
+            c.create_polygon(l1x, l1y, r1x, r1y, r2x, r2y, l2x, l2y, fill="#2f2c29", outline="")
+            if elev > 0.2:
+                # Side wall shadows for raised roads.
+                wall_drop = max(6, min(26, int(elev * 4)))
+                c.create_polygon(r1x, r1y, r2x, r2y, r2x, r2y + wall_drop, r1x, r1y + wall_drop,
+                                 fill="#242424", outline="")
+                c.create_polygon(l1x, l1y, l2x, l2y, l2x, l2y + wall_drop, l1x, l1y + wall_drop,
+                                 fill="#1f1f1f", outline="")
             c.create_line(l1x, l1y, l2x, l2y, fill=road_col, width=2)
             c.create_line(r1x, r1y, r2x, r2y, fill=road_col, width=2)
+            c.create_line((l1x + r1x) * 0.5, (l1y + r1y) * 0.5, (l2x + r2x) * 0.5, (l2y + r2y) * 0.5,
+                          fill="#d8d2aa", width=1, dash=(5, 6))
 
         cx = w * 0.5
-        base_y = h - 72
+        base_y = h - 76
         c.create_polygon(
             cx - 30, base_y,
             cx + 30, base_y,
@@ -2204,7 +2291,7 @@ class App:
         c.create_text(14, 14, anchor="nw", fill="#dce7ff", font=("Consolas", 11, "bold"),
                       text=f"Speed: {speed_kmh:5.1f} km/h")
         c.create_text(14, 34, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
-                      text="Controls: W/S throttle, A/D steer, Arrow keys supported")
+                      text="Controls: W/S throttle, A/D steer, Arrow keys supported | Ramps + buildings enabled")
         if nearest:
             _sx, _sy, _ang, road, dist = nearest
             c.create_text(14, 54, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
@@ -2331,6 +2418,7 @@ class App:
             self._push_undo()
             self.roads     = {}
             self.connectors = []
+            self.structures = []
             self._pending_connector = None
             self.current   = []
             self.selected  = None
@@ -3088,6 +3176,205 @@ Tools > Open Installation Guide
             messagebox.showinfo("Validation Result", "File is valid.")
             self._set_status("Validation passed")
 
+    def _osm_request_json(self, url, params=None, method="GET"):
+        headers = {
+            "User-Agent": "RoadGISPro/1.0 (offline analysis mode)",
+            "Accept": "application/json",
+        }
+        if method == "GET":
+            query = urllib.parse.urlencode(params or {})
+            full = f"{url}?{query}" if query else url
+            req = urllib.request.Request(full, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        data = urllib.parse.urlencode(params or {}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _parse_num(self, raw, default=0.0):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            if raw is None:
+                return float(default)
+            m = re.search(r"-?\d+(\.\d+)?", str(raw))
+            if m:
+                try:
+                    return float(m.group(0))
+                except (TypeError, ValueError):
+                    return float(default)
+            return float(default)
+
+    def _apply_payload_to_layer(self, payload, source_label, mark_dirty=True):
+        self.roads = {}
+        self.connectors = self._normalize_connectors(payload.get("connectors", []))
+        self.structures = payload.get("structures", []) if isinstance(payload.get("structures", []), list) else []
+        self._pending_connector = None
+        self.current = []
+        self.selected = None
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        for d in payload.get("roads", []):
+            try:
+                r = Road.from_dict(d)
+            except (TypeError, ValueError, KeyError):
+                continue
+            self.roads[r.id] = r
+        self.file = None
+        self.dirty = bool(mark_dirty)
+        self.build_graph()
+        self._road_count_var.set(str(len(self.roads)))
+        self._info_var.set("No feature selected")
+        self.root.title(f"{APP_TITLE}  -  {source_label}")
+        self.zoom_fit()
+        self.redraw()
+
+    def _suggest_name(self, raw):
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw.strip())
+        return cleaned[:64] or "osm_area"
+
+    def open_osm_download_dialog(self):
+        area = simpledialog.askstring(
+            "OSM Mode",
+            "What area do you want to download for offline analysis?\nExamples: Dallas, Tokyo, Berlin",
+            parent=self.root,
+        )
+        if not area:
+            return
+        if not self._ask_save():
+            return
+        self._set_status(f"OSM download started for '{area}'")
+        self.root.update_idletasks()
+        try:
+            geo = self._osm_request_json(
+                NOMINATIM_URL,
+                params={"q": area, "format": "jsonv2", "limit": 1},
+                method="GET",
+            )
+            if not isinstance(geo, list) or not geo:
+                messagebox.showerror("OSM Mode", f"Area not found: {area}")
+                return
+            hit = geo[0]
+            bbox = hit.get("boundingbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                messagebox.showerror("OSM Mode", f"No bounding box available for: {area}")
+                return
+            south, north, west, east = [self._parse_num(v, 0.0) for v in bbox]
+            overpass_query = (
+                "[out:json][timeout:60];("
+                f'way["highway"]({south},{west},{north},{east});'
+                f'way["building"]({south},{west},{north},{east});'
+                ");(._;>;);out body;"
+            )
+            osm = self._osm_request_json(OVERPASS_URL, params={"data": overpass_query}, method="POST")
+            elements = osm.get("elements", []) if isinstance(osm, dict) else []
+            nodes = {}
+            ways = []
+            for el in elements:
+                if not isinstance(el, dict):
+                    continue
+                et = el.get("type")
+                if et == "node":
+                    nodes[el.get("id")] = (self._parse_num(el.get("lon")), self._parse_num(el.get("lat")))
+                elif et == "way":
+                    ways.append(el)
+
+            if not nodes:
+                messagebox.showerror("OSM Mode", "No OSM node data returned for this area.")
+                return
+
+            mean_lat = sum(v[1] for v in nodes.values()) / max(1, len(nodes))
+            mean_lon = sum(v[0] for v in nodes.values()) / max(1, len(nodes))
+            cos_lat = max(0.2, math.cos(math.radians(mean_lat)))
+
+            def world_xy(lon, lat):
+                x = (lon - mean_lon) * 111_320.0 * cos_lat
+                y = (lat - mean_lat) * 110_540.0
+                return [x, -y]
+
+            hwy_map = {
+                "motorway": "motorway", "trunk": "motorway", "primary": "primary",
+                "secondary": "secondary", "tertiary": "tertiary",
+                "residential": "residential", "service": "service",
+                "unclassified": "unclassified", "motorway_link": "service", "trunk_link": "service",
+                "primary_link": "service", "secondary_link": "service", "tertiary_link": "service",
+            }
+            default_speed = {
+                "motorway": 110, "primary": 80, "secondary": 60,
+                "tertiary": 50, "residential": 35, "service": 25, "unclassified": 45,
+            }
+            roads = []
+            structures = []
+            for way in ways:
+                tags = way.get("tags", {}) if isinstance(way.get("tags"), dict) else {}
+                refs = way.get("nodes", [])
+                if not isinstance(refs, list):
+                    continue
+                geom = []
+                for nid in refs:
+                    if nid not in nodes:
+                        continue
+                    lon, lat = nodes[nid]
+                    geom.append(world_xy(lon, lat))
+                if len(geom) < 2:
+                    continue
+                if "highway" in tags:
+                    osm_type = str(tags.get("highway", "unclassified"))
+                    rtype = hwy_map.get(osm_type, "unclassified")
+                    speed = int(max(10, self._parse_num(tags.get("maxspeed"), default_speed.get(rtype, 45))))
+                    lanes = int(max(1, self._parse_num(tags.get("lanes"), 2)))
+                    bridge_level = int(self._parse_num(tags.get("layer"), 0))
+                    if as_bool(tags.get("bridge", False)) and bridge_level <= 0:
+                        bridge_level = 1
+                    road = Road(
+                        name=str(tags.get("name", tags.get("ref", f"{osm_type} road"))),
+                        rtype=rtype,
+                        speed=speed,
+                        lanes=lanes,
+                        oneway=as_bool(tags.get("oneway", False)),
+                        geom=geom,
+                        ref=str(tags.get("ref", "")),
+                        bridge_level=bridge_level,
+                        tunnel=as_bool(tags.get("tunnel", False)),
+                        surface=str(tags.get("surface", "asphalt")),
+                        max_weight=self._parse_num(tags.get("maxweight"), 0.0),
+                        lit=as_bool(tags.get("lit", False)),
+                    )
+                    roads.append(road.to_dict())
+                elif "building" in tags and len(geom) >= 3:
+                    levels = self._parse_num(tags.get("building:levels"), 2)
+                    height = self._parse_num(tags.get("height"), max(6.0, levels * 3.2))
+                    if geom[0] != geom[-1]:
+                        geom.append(list(geom[0]))
+                    structures.append({
+                        "name": str(tags.get("name", "building")),
+                        "footprint": geom,
+                        "height": max(4.0, float(height)),
+                    })
+
+            if not roads:
+                messagebox.showwarning("OSM Mode", "No roads found in selected area.")
+                return
+            payload = {"roads": roads, "connectors": [], "structures": structures}
+            self._apply_payload_to_layer(payload, f"OSM: {area}", mark_dirty=True)
+            self._set_status(f"OSM area loaded: {area} | roads={len(roads)} buildings={len(structures)}")
+
+            if messagebox.askyesno("Save Offline Copy", "Do you want to save this OSM area offline now?"):
+                suggested = self._suggest_name(area) + FILE_EXT
+                path = filedialog.asksaveasfilename(
+                    defaultextension=FILE_EXT,
+                    initialfile=suggested,
+                    filetypes=[("RoadGIS Layer", f"*{FILE_EXT}"), ("All Files", "*.*")],
+                    title="Save OSM Offline Layer",
+                )
+                if path:
+                    self.file = path
+                    self._write_file(path)
+        except Exception as ex:
+            self._log_exception("OSM download failed", ex, context=area)
+            messagebox.showerror("OSM Mode", f"Failed to download/import OSM data:\n{ex}")
+
     def save(self):
         if not self.file:
             return self.save_as()
@@ -3110,6 +3397,7 @@ Tools > Open Installation Guide
             data = {
                 "roads": [r.to_dict() for r in self.roads.values()],
                 "connectors": self.connectors,
+                "structures": self.structures,
             }
             encoded = encode_rgis(data)
             with open(tmp_path, "wb") as f:
@@ -3141,11 +3429,13 @@ Tools > Open Installation Guide
             payload = {
                 "roads": [r.to_dict() for r in self.roads.values()],
                 "connectors": self.connectors,
+                "structures": self.structures,
             }
             metrics = self._compute_metrics_polyglot(payload)
             plugin_payload = {
                 "roads": payload["roads"],
                 "connectors": payload["connectors"],
+                "structures": payload["structures"],
                 "feature_count": len(self.roads),
                 "metrics": metrics,
             }
@@ -3154,7 +3444,9 @@ Tools > Open Installation Guide
                 json.dump({
                     "roads":         payload["roads"],
                     "connectors":    payload["connectors"],
+                    "structures":    payload["structures"],
                     "feature_count": len(self.roads),
+                    "structure_count": len(self.structures),
                     "graph_nodes":   len(self.graph),
                     "metrics":       metrics,
                     "plugin_outputs": plugin_outputs,
@@ -3171,6 +3463,9 @@ Tools > Open Installation Guide
         connectors = payload.get("connectors", [])
         if not isinstance(connectors, list):
             connectors = []
+        structures = payload.get("structures", [])
+        if not isinstance(structures, list):
+            structures = []
         road_count = len(roads)
         total_len = 0.0
         total_speed = 0.0
@@ -3211,6 +3506,7 @@ Tools > Open Installation Guide
             "engine": "python-fallback",
             "road_count": road_count,
             "connector_count": len(connectors),
+            "structure_count": len(structures),
             "total_length_km": total_len / 1000.0,
             "average_speed_limit": avg_speed,
             "average_lanes": avg_lanes,
@@ -3255,15 +3551,18 @@ Tools > Open Installation Guide
             if os.path.splitext(path)[1].lower() == ".json":
                 payload = json.loads(raw.decode("utf-8"))
                 if isinstance(payload, list):
-                    payload = {"roads": payload, "connectors": []}
+                    payload = {"roads": payload, "connectors": [], "structures": []}
                 if not isinstance(payload, dict) or "roads" not in payload:
                     raise ValueError("Expected a JSON array or object with 'roads' key.")
                 if "connectors" not in payload or not isinstance(payload["connectors"], list):
                     payload["connectors"] = []
+                if "structures" not in payload or not isinstance(payload["structures"], list):
+                    payload["structures"] = []
             else:
                 payload = decode_rgis(raw)
             self.roads    = {}
             self.connectors = self._normalize_connectors(payload.get("connectors", []))
+            self.structures = payload.get("structures", []) if isinstance(payload.get("structures", []), list) else []
             self._pending_connector = None
             self.current  = []
             self.selected = None
@@ -3295,6 +3594,7 @@ Tools > Open Installation Guide
             return
         self.roads     = {}
         self.connectors = []
+        self.structures = []
         self._pending_connector = None
         self.current   = []
         self.selected  = None
