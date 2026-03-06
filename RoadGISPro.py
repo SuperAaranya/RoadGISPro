@@ -2190,7 +2190,7 @@ class App:
         h = c.winfo_height() or 620
         c.delete("all")
 
-        horizon = h * 0.42
+        horizon = h * 0.36
         c.create_rectangle(0, 0, w, horizon, fill="#142036", outline="")
         c.create_rectangle(0, horizon, w, h, fill="#1c1f24", outline="")
 
@@ -2202,14 +2202,13 @@ class App:
         cos_h = math.cos(heading)
         sin_h = math.sin(heading)
         near_plane = 3.0
-        lane_width = 11.0
         seg_draw = []
         sign_draw = []
 
         def proj(xc, zc, elev=0.0):
-            scale = 760.0 / (zc + 70.0)
+            scale = 760.0 / (zc + 75.0)
             sx = w * 0.5 + xc * scale
-            sy = horizon + 255.0 / (zc + 45.0) - elev * scale
+            sy = horizon + 275.0 / (zc + 48.0) - elev * scale
             return sx, sy, scale
 
         def draw_building_box(cx, cz, width_world, height_world, depth=0.0, color="#476086"):
@@ -2251,12 +2250,14 @@ class App:
                     zb = near_plane
                     xb = xb + t * (xa - xb)
             elev = max(-1.0, min(6.0, float(getattr(road, "bridge_level", 0)) * 2.2))
+            lanes = max(1, int(getattr(road, "lanes", 1)))
+            lane_width = max(7.5, min(18.0, lanes * DRIVE_LANE_WIDTH_M * 0.9))
             l1x, l1y, _ = proj(xa - lane_width, za, elev)
             r1x, r1y, _ = proj(xa + lane_width, za, elev)
             l2x, l2y, _ = proj(xb - lane_width, zb, elev)
             r2x, r2y, _ = proj(xb + lane_width, zb, elev)
             depth = min(za, zb)
-            seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev))
+            seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev, lanes, lane_width))
             if 12.0 < depth < 220.0:
                 sx, sy, _ = proj(xa + lane_width + 3.5, za, elev + 1.0)
                 sign_draw.append((depth, sx, sy, int(max(10, getattr(road, "speed", 30)))))
@@ -2291,7 +2292,7 @@ class App:
         for zc, xc, width, depth, height in b_draw:
             draw_building_box(xc, zc, width, height, depth=depth, color="#4b6388")
 
-        for _depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev in seg_draw:
+        for _depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev, lanes, lane_width in seg_draw:
             road_col = ROAD_STYLES.get(road.rtype, {}).get("color", "#777")
             # Deck with ramp/elevation cues.
             c.create_polygon(l1x, l1y, r1x, r1y, r2x, r2y, l2x, l2y, fill="#2f2c29", outline="")
@@ -2306,6 +2307,15 @@ class App:
             c.create_line(r1x, r1y, r2x, r2y, fill=road_col, width=2)
             c.create_line((l1x + r1x) * 0.5, (l1y + r1y) * 0.5, (l2x + r2x) * 0.5, (l2y + r2y) * 0.5,
                           fill="#d8d2aa", width=1, dash=(5, 6))
+            if lanes >= 3:
+                # Extra dashed lane separators for wider roads.
+                off = lane_width * 0.35
+                c.create_line((l1x + r1x) * 0.5 - off, (l1y + r1y) * 0.5,
+                              (l2x + r2x) * 0.5 - off, (l2y + r2y) * 0.5,
+                              fill="#b8b18f", width=1, dash=(4, 8))
+                c.create_line((l1x + r1x) * 0.5 + off, (l1y + r1y) * 0.5,
+                              (l2x + r2x) * 0.5 + off, (l2y + r2y) * 0.5,
+                              fill="#b8b18f", width=1, dash=(4, 8))
 
         for _depth, sx, sy, speed_lim in sorted(sign_draw, key=lambda it: it[0], reverse=True):
             pole_h = 18
@@ -2313,24 +2323,44 @@ class App:
             c.create_oval(sx - 10, sy - pole_h - 10, sx + 10, sy - pole_h + 10, fill="#ffffff", outline="#cc2222", width=2)
             c.create_text(sx, sy - pole_h, text=str(speed_lim), fill="#202020", font=("Consolas", 7, "bold"))
 
+        # Third-person car with visible roof + rear face.
         cx = w * 0.5
-        base_y = h - 76
+        base_y = h - 92
+        car_w = 54
+        car_h = 58
+        rear_h = 18
         c.create_polygon(
-            cx - 30, base_y,
-            cx + 30, base_y,
-            cx + 22, base_y - 42,
-            cx - 22, base_y - 42,
-            fill="#d91010",
-            outline="#ffaeae",
+            cx - car_w * 0.5, base_y,
+            cx + car_w * 0.5, base_y,
+            cx + car_w * 0.42, base_y - car_h,
+            cx - car_w * 0.42, base_y - car_h,
+            fill="#c41212",
+            outline="#ffb0b0",
             width=2,
         )
-        c.create_rectangle(cx - 12, base_y - 34, cx + 12, base_y - 20, fill="#8a0000", outline="")
+        c.create_polygon(
+            cx - car_w * 0.5, base_y,
+            cx + car_w * 0.5, base_y,
+            cx + car_w * 0.36, base_y + rear_h,
+            cx - car_w * 0.36, base_y + rear_h,
+            fill="#7f0b0b",
+            outline="#3b0606",
+            width=1,
+        )
+        c.create_polygon(
+            cx - car_w * 0.28, base_y - car_h * 0.70,
+            cx + car_w * 0.28, base_y - car_h * 0.70,
+            cx + car_w * 0.22, base_y - car_h * 0.26,
+            cx - car_w * 0.22, base_y - car_h * 0.26,
+            fill="#6a0a0a",
+            outline="#a33",
+        )
 
         speed_kmh = max(0.0, self._drive_speed * 0.9)
         c.create_text(14, 14, anchor="nw", fill="#dce7ff", font=("Consolas", 11, "bold"),
                       text=f"Speed: {speed_kmh:5.1f} km/h")
         c.create_text(14, 34, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
-                      text="Controls: W/S throttle, A/D steer, Arrow keys supported | Ramps + buildings enabled")
+                      text="Controls: W/S throttle, A/D steer, Arrow keys supported | Ramps + lane-aware roads")
         if nearest:
             _sx, _sy, _ang, road, dist = nearest
             c.create_text(14, 54, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
@@ -2750,9 +2780,9 @@ Tools > Open Installation Guide
 - Clone/share this framework so contributors can build Go/Rust plugins quickly.
 
 3) Platform installer targets
-- Windows 11: .exe and .msi
-- Debian Linux: .deb
-- macOS Sonoma/Sequoia/Tahoe: signed app/pkg workflow
+- Windows 11: .exe and .msi (active)
+- Debian Linux: coming soon
+- macOS Sonoma/Sequoia/Tahoe: coming soon
 
 4) Build installer helper
 - Use Tools > Build Installers for platform-specific commands.
