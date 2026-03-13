@@ -6,9 +6,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = if ($RepoRoot) {
-    Resolve-Path $RepoRoot
+    (Resolve-Path $RepoRoot).Path
 } else {
-    Resolve-Path (Join-Path $PSScriptRoot "..\..\")
+    (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 }
 $workRoot = Join-Path $PSScriptRoot "work"
 $payload = Join-Path $workRoot "payload"
@@ -20,7 +20,7 @@ if (-not (Test-Path $issFile)) {
 }
 
 Write-Host "Preparing payload..."
-& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "prepare_payload.ps1") -RepoRoot $repoRoot
+& (Join-Path $PSScriptRoot "prepare_payload.ps1") -RepoRoot $repoRoot
 
 if (-not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null
@@ -31,8 +31,9 @@ $isccCandidates = @(
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
     "C:\Program Files\Inno Setup 6\ISCC.exe"
 ) | Where-Object { $_ -and (Test-Path $_) }
+$isccCandidates = @($isccCandidates)
 
-if (-not $isccCandidates) {
+if ($isccCandidates.Count -eq 0) {
     throw "ISCC.exe not found. Install Inno Setup 6 or set ISCC_PATH."
 }
 
