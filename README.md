@@ -35,6 +35,18 @@ From the project folder:
 python RoadGISPro.py
 ```
 
+## Windows Installer (EXE/MSI)
+
+Installer build scripts live in:
+
+`installer/windows-exe`
+
+Quick build:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\installer\windows-exe\build_exe.ps1" -Version "1.0.0"
+```
+
 ## Files
 
 - `RoadGISPro.py`: Main application.

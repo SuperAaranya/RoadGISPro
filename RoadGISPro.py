@@ -4,6 +4,7 @@ import json
 import uuid
 import math
 import os
+import sys
 import base64
 import hashlib
 import struct
@@ -27,8 +28,29 @@ FILE_VERSION = 1
 FILE_EXT     = ".rgis"
 FILE_KEY     = b"RoadGISPro\x7f\x3a\x91\xb4\x2d\xe0\x55\xc8"
 APP_TITLE    = "RoadGIS Pro"
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_user_data_dir():
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if root:
+            return os.path.join(root, "RoadGISPro")
+    return os.path.join(os.path.expanduser("~"), ".roadgispro")
+
+
+BASE_DIR = _resolve_base_dir()
+USER_DATA_DIR = _resolve_user_data_dir()
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+
 POLYGLOT_DIR = os.path.join(BASE_DIR, "polyglot")
+INSTALL_PLUGIN_DIR = os.path.join(POLYGLOT_DIR, "plugins")
+USER_PLUGIN_DIR = os.path.join(USER_DATA_DIR, "plugins")
 RUST_ROUTER_MANIFEST = os.path.join(POLYGLOT_DIR, "rust_router", "Cargo.toml")
 RUST_ROUTER_BIN = os.path.join(
     POLYGLOT_DIR, "rust_router", "target", "release",
@@ -39,15 +61,18 @@ GO_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "go", "metrics.go")
 CSHARP_METRICS_PROJECT = os.path.join(POLYGLOT_DIR, "csharp", "MetricsEngine.csproj")
 RUBY_METRICS_SCRIPT = os.path.join(POLYGLOT_DIR, "ruby", "metrics.rb")
 JAVA_METRICS_SOURCE = os.path.join(POLYGLOT_DIR, "java", "MetricsEngine.java")
-PLUGIN_DIR = os.path.join(POLYGLOT_DIR, "plugins")
-PLUGIN_REGISTRY_PATH = os.path.join(PLUGIN_DIR, "registry.json")
-PLUGIN_MANIFESTS_DIR = os.path.join(PLUGIN_DIR, "manifests")
+PLUGIN_DIR = USER_PLUGIN_DIR
+PLUGIN_REGISTRY_PATH = os.path.join(USER_DATA_DIR, "plugin_registry.json")
+PLUGIN_MANIFESTS_DIRS = [
+    os.path.join(INSTALL_PLUGIN_DIR, "manifests"),
+    os.path.join(USER_PLUGIN_DIR, "manifests"),
+]
 GO_VALIDATOR_SCRIPT = os.path.join(POLYGLOT_DIR, "validators", "go_validator", "validator.go")
 RUST_VALIDATOR_MANIFEST = os.path.join(POLYGLOT_DIR, "validators", "rust_validator", "Cargo.toml")
-POLYGLOT_RUNTIME_CONFIG = os.path.join(POLYGLOT_DIR, "runtime_config.json")
+POLYGLOT_RUNTIME_CONFIG = os.path.join(USER_DATA_DIR, "runtime_config.json")
 POLYGLOT_SETUP_SCRIPT = os.path.join(POLYGLOT_DIR, "setup", "setup_languages.py")
-APP_LOG_PATH = os.path.join(BASE_DIR, "roadgis.log")
-APP_STATE_PATH = os.path.join(BASE_DIR, ".roadgis_state.json")
+APP_LOG_PATH = os.path.join(USER_DATA_DIR, "roadgis.log")
+APP_STATE_PATH = os.path.join(USER_DATA_DIR, ".roadgis_state.json")
 PLUGIN_FRAMEWORK_PATH = os.path.abspath(
     os.path.join(BASE_DIR, "..", "..", "..", "Frameworks", "RoadGIS-Plugin-Framework")
 )
@@ -143,6 +168,8 @@ DRIVE_LOCK_DIST = 90.0
 DRIVE_HARD_LIMIT_DIST = 220.0
 DRIVE_LANE_WIDTH_M = 3.4
 DRIVE_MAX_LANE_OFFSET = 9.0
+DRIVE_VIEW_DIST = 380.0
+DRIVE_INDEX_CELL = 160.0
 
 MAP_BG      = "#1a2030"
 DARK_BG     = "#111520"
@@ -384,6 +411,7 @@ class App:
         self._tooltip_win   = None
         self._pending_tip   = None
         self._redraw_queued = False
+        self._last_mouse_screen = None
         self._undo_stack    = []
         self._redo_stack    = []
         self._clipboard     = None
@@ -397,6 +425,9 @@ class App:
         self._drive_speed   = 0.0
         self._drive_lane_offset = 0.0
         self._drive_elev = 0.0
+        self._drive_seg_index = None
+        self._drive_struct_index = None
+        self._drive_index_dirty = True
         self._osm_job_thread = None
         self._osm_cancel_event = None
         self._osm_queue = None
@@ -1093,12 +1124,13 @@ class App:
     def on_mouse_move(self, e):
         wx, wy = self.world(e.x, e.y)
         self._coords_var.set(f"X: {wx:,.1f}   Y: {wy:,.1f}")
+        self._last_mouse_screen = (e.x, e.y)
 
         if self.mode == "select":
             road, _ = self._hit_test(wx, wy)
             if road is not self.hover:
                 self.hover = road
-                self.redraw()
+                self.request_redraw()
                 if road:
                     self._schedule_tooltip(road, e.x_root, e.y_root)
                 else:
@@ -1106,14 +1138,10 @@ class App:
         else:
             if self.hover is not None:
                 self.hover = None
-                self.redraw()
+                self.request_redraw()
 
         if self.current and self.mode == "draw":
-            self.redraw()
-            lx, ly = self.screen(*self.current[-1])
-            self.canvas.create_line(lx, ly, e.x, e.y,
-                                    dash=(5, 4), fill=ACCENT,
-                                    width=1.5, tags="preview")
+            self.request_redraw()
 
     def on_drag(self, e):
         if self.mode == "pan":
@@ -1137,7 +1165,7 @@ class App:
                         conn["b"] = [new_pt[0], new_pt[1], level]
                 self.dirty = True
                 self.build_graph()
-                self.redraw()
+                self.request_redraw()
 
     def on_release(self, e):
         if self.mode in ("select", "pan"):
@@ -1156,7 +1184,7 @@ class App:
         self.offy  = e.y - (e.y - self.offy) * factor
         self.scale *= factor
         self._update_zoom_label()
-        self.redraw()
+        self.request_redraw()
 
     def pan_start(self, e):
         self._pan_origin = (e.x, e.y, self.offx, self.offy)
@@ -1166,7 +1194,7 @@ class App:
             ox, oy, bx, by = self._pan_origin
             self.offx = bx + (e.x - ox)
             self.offy = by + (e.y - oy)
-            self.redraw()
+            self.request_redraw()
 
     def _update_zoom_label(self):
         approx = int(1000 / max(self.scale, 0.001))
@@ -1312,6 +1340,16 @@ class App:
             flat.extend([sx, sy])
         return flat
 
+    def request_redraw(self):
+        if self._redraw_queued:
+            return
+        self._redraw_queued = True
+        self.root.after(16, self._run_redraw)
+
+    def _run_redraw(self):
+        self._redraw_queued = False
+        self.redraw()
+
     def redraw(self):
         c = self.canvas
         c.delete("all")
@@ -1348,7 +1386,10 @@ class App:
             for r in road_order:
                 style   = ROAD_STYLES.get(r.rtype, {"casing": "#222", "width": 2})
                 w_px    = style["width"] * max(0.6, self.scale ** 0.32) + 2.5
-                flat    = self._geoms_to_flat_screen(smooth_geom(r.geom))
+                draw_pts = r.geom
+                if len(r.geom) <= 200 or self.scale > 0.6:
+                    draw_pts = smooth_geom(r.geom)
+                flat    = self._geoms_to_flat_screen(draw_pts)
                 if len(flat) >= 4:
                     c.create_line(*flat, width=w_px, fill=style["casing"],
                                   capstyle="round", joinstyle="round")
@@ -1359,7 +1400,9 @@ class App:
             style    = ROAD_STYLES.get(r.rtype, {"color": "#aaa", "width": 2})
             color    = style["color"]
             width    = style["width"] * max(0.6, self.scale ** 0.32)
-            draw_pts = smooth_geom(r.geom)
+            draw_pts = r.geom
+            if len(r.geom) <= 200 or self.scale > 0.6:
+                draw_pts = smooth_geom(r.geom)
             flat     = self._geoms_to_flat_screen(draw_pts)
 
             if len(flat) < 4:
@@ -1438,7 +1481,9 @@ class App:
                 name = r.name
                 if not name or name == "Unnamed":
                     continue
-                smooth_pts = smooth_geom(r.geom)
+                smooth_pts = r.geom
+                if len(r.geom) <= 200 or self.scale > 0.8:
+                    smooth_pts = smooth_geom(r.geom)
                 min_spacing = max(60, 180 / max(self.scale, 0.01))
                 positions = label_positions(
                     [(p[0], p[1]) for p in smooth_pts],
@@ -1464,6 +1509,13 @@ class App:
             sx, sy = self.screen(*pt)
             c.create_oval(sx - 5, sy - 5, sx + 5, sy + 5,
                           fill=ACCENT, outline="white", width=1)
+
+        if self.current and self.mode == "draw" and self._last_mouse_screen:
+            lx, ly = self.screen(*self.current[-1])
+            ex, ey = self._last_mouse_screen
+            c.create_line(lx, ly, ex, ey,
+                          dash=(5, 4), fill=ACCENT,
+                          width=1.5, tags="preview")
 
         self._draw_scale_bar()
         self._draw_north_arrow()
@@ -1659,6 +1711,7 @@ class App:
     def build_graph(self):
         self._prune_orphan_connectors()
         self.graph = {}
+        self._drive_index_dirty = True
         for r in self.roads.values():
             for i in range(len(r.geom) - 1):
                 a = (r.geom[i][0], r.geom[i][1], int(r.bridge_level))
@@ -1815,8 +1868,16 @@ class App:
                 self._log("WARN", "Empty process output", context=" ".join(cmd))
                 return None
             return json.loads(raw)
+        except subprocess.CalledProcessError as ex:
+            stderr = (ex.stderr or "").strip()
+            if stderr:
+                self._log("ERROR", f"Process stderr: {stderr}", context=" ".join(cmd))
+            self._log_exception("External process failed", ex, context=" ".join(cmd))
+            self._set_status("External tool failed - see roadgis.log")
+            return None
         except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as ex:
             self._log_exception("External process failed", ex, context=" ".join(cmd))
+            self._set_status("External tool failed - see roadgis.log")
             return None
 
     def _shortest_time_path_polyglot(self, start, end):
@@ -2004,10 +2065,65 @@ class App:
                 bx, by = r.geom[i + 1]
                 yield r, ax, ay, bx, by
 
+    def _ensure_drive_index(self):
+        if not self._drive_index_dirty and self._drive_seg_index is not None:
+            return
+        cell = DRIVE_INDEX_CELL
+        seg_index = {}
+        for r, ax, ay, bx, by in self._iter_road_segments():
+            mx = (ax + bx) * 0.5
+            my = (ay + by) * 0.5
+            key = (int(mx // cell), int(my // cell))
+            seg_index.setdefault(key, []).append((r, ax, ay, bx, by))
+
+        struct_index = {}
+        for st in self.structures:
+            if not isinstance(st, dict):
+                continue
+            fp = st.get("footprint", [])
+            if not isinstance(fp, list) or len(fp) < 3:
+                continue
+            pts = [p for p in fp if isinstance(p, (list, tuple)) and len(p) >= 2]
+            if len(pts) < 3:
+                continue
+            cx = sum(float(p[0]) for p in pts) / len(pts)
+            cy = sum(float(p[1]) for p in pts) / len(pts)
+            width = max(8.0, min(40.0, math.sqrt(len(pts)) * 8.0))
+            depth = max(8.0, min(40.0, width * 0.9))
+            height = max(8.0, min(90.0, float(self._parse_num(st.get("height"), 18.0))))
+            key = (int(cx // cell), int(cy // cell))
+            struct_index.setdefault(key, []).append((cx, cy, width, depth, height))
+
+        self._drive_seg_index = seg_index
+        self._drive_struct_index = struct_index
+        self._drive_index_dirty = False
+
+    def _iter_drive_segments_near(self, px, py, radius=DRIVE_VIEW_DIST):
+        self._ensure_drive_index()
+        cell = DRIVE_INDEX_CELL
+        cx = int(px // cell)
+        cy = int(py // cell)
+        reach = int(radius // cell) + 1
+        for ix in range(cx - reach, cx + reach + 1):
+            for iy in range(cy - reach, cy + reach + 1):
+                for seg in self._drive_seg_index.get((ix, iy), []):
+                    yield seg
+
+    def _iter_drive_structs_near(self, px, py, radius=DRIVE_VIEW_DIST):
+        self._ensure_drive_index()
+        cell = DRIVE_INDEX_CELL
+        cx = int(px // cell)
+        cy = int(py // cell)
+        reach = int(radius // cell) + 1
+        for ix in range(cx - reach, cx + reach + 1):
+            for iy in range(cy - reach, cy + reach + 1):
+                for st in self._drive_struct_index.get((ix, iy), []):
+                    yield st
+
     def _nearest_segment_projection(self, px, py):
         best = None
         best_d = float("inf")
-        for r, ax, ay, bx, by in self._iter_road_segments():
+        for r, ax, ay, bx, by in self._iter_drive_segments_near(px, py, radius=DRIVE_VIEW_DIST * 1.3):
             dx = bx - ax
             dy = by - ay
             denom = dx * dx + dy * dy
@@ -2058,6 +2174,8 @@ class App:
         if not self.roads:
             self._set_status("Drive mode unavailable: draw at least one road first")
             return
+        self._drive_index_dirty = True
+        self._ensure_drive_index()
         if self._drive_win and self._drive_win.winfo_exists():
             self._drive_win.deiconify()
             self._drive_win.lift()
@@ -2230,7 +2348,7 @@ class App:
             c.create_polygon(brx, bry, bbrx, bbry, btrx, btry, trx, try_, fill="#394c6e", outline="#243247")
             c.create_polygon(tlx, tly, trx, try_, btrx, btry, btlx, btly, fill="#5c7296", outline="#243247")
 
-        for road, ax, ay, bx, by in self._iter_road_segments():
+        for road, ax, ay, bx, by in self._iter_drive_segments_near(px, py):
             dax = ax - px
             day = ay - py
             dbx = bx - px
@@ -2239,6 +2357,8 @@ class App:
             xa = -sin_h * dax + cos_h * day
             zb = cos_h * dbx + sin_h * dby
             xb = -sin_h * dbx + cos_h * dby
+            if za > DRIVE_VIEW_DIST and zb > DRIVE_VIEW_DIST:
+                continue
             if za <= near_plane and zb <= near_plane:
                 continue
             if za <= near_plane or zb <= near_plane:
@@ -2258,32 +2378,19 @@ class App:
             r2x, r2y, _ = proj(xb + lane_width, zb, elev)
             depth = min(za, zb)
             seg_draw.append((depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev, lanes, lane_width))
-            if 12.0 < depth < 220.0:
+            if 12.0 < depth < min(220.0, DRIVE_VIEW_DIST):
                 sx, sy, _ = proj(xa + lane_width + 3.5, za, elev + 1.0)
                 sign_draw.append((depth, sx, sy, int(max(10, getattr(road, "speed", 30)))))
 
         # Building massing from OSM structures.
         b_draw = []
-        for st in self.structures:
-            if not isinstance(st, dict):
-                continue
-            fp = st.get("footprint", [])
-            if not isinstance(fp, list) or len(fp) < 3:
-                continue
-            pts = [p for p in fp if isinstance(p, (list, tuple)) and len(p) >= 2]
-            if len(pts) < 3:
-                continue
-            cx = sum(float(p[0]) for p in pts) / len(pts)
-            cy = sum(float(p[1]) for p in pts) / len(pts)
+        for cx, cy, width, depth, height in self._iter_drive_structs_near(px, py):
             dx = cx - px
             dy = cy - py
             zc = cos_h * dx + sin_h * dy
             xc = -sin_h * dx + cos_h * dy
-            if zc <= near_plane:
+            if zc <= near_plane or zc > DRIVE_VIEW_DIST:
                 continue
-            width = max(8.0, min(40.0, math.sqrt(len(pts)) * 8.0))
-            depth = max(8.0, min(40.0, width * 0.9))
-            height = max(8.0, min(90.0, float(self._parse_num(st.get("height"), 18.0))))
             b_draw.append((zc, xc, width, depth, height))
 
         seg_draw.sort(key=lambda it: it[0], reverse=True)
@@ -2488,6 +2595,7 @@ class App:
             self.roads     = {}
             self.connectors = []
             self.structures = []
+            self._drive_index_dirty = True
             self._pending_connector = None
             self.current   = []
             self.selected  = None
@@ -2504,6 +2612,7 @@ class App:
         ctx = f" | {context}" if context else ""
         line = f"[{stamp}] [{level}] {message}{ctx}\n"
         try:
+            os.makedirs(USER_DATA_DIR, exist_ok=True)
             with open(APP_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(line)
         except OSError:
@@ -2547,7 +2656,7 @@ class App:
         return cfg
 
     def _save_runtime_config(self):
-        os.makedirs(POLYGLOT_DIR, exist_ok=True)
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
         try:
             with open(POLYGLOT_RUNTIME_CONFIG, "w", encoding="utf-8") as f:
                 json.dump(self._runtime_cfg, f, indent=2)
@@ -2567,7 +2676,11 @@ class App:
 
     def open_polyglot_setup(self, selected_tokens=None):
         if not os.path.exists(POLYGLOT_SETUP_SCRIPT):
-            messagebox.showerror("Polyglot Setup", f"Setup script not found:\n{POLYGLOT_SETUP_SCRIPT}")
+            messagebox.showerror(
+                "Polyglot Setup",
+                "Setup script not found. Reinstall or verify the polyglot folder:\n"
+                f"{POLYGLOT_SETUP_SCRIPT}",
+            )
             return
         if selected_tokens is None:
             selected = []
@@ -2659,13 +2772,13 @@ class App:
             pady=6,
         ).pack(fill="x")
 
-        os_var = tk.StringVar(value="Windows 11")
+        os_var = tk.StringVar(value="Windows 11 (active)")
         os_options = [
-            "Windows 11",
-            "Debian Linux",
-            "macOS Sonoma",
-            "macOS Sequoia",
-            "macOS Tahoe",
+            "Windows 11 (active)",
+            "Debian Linux (coming soon)",
+            "macOS Sonoma (coming soon)",
+            "macOS Sequoia (coming soon)",
+            "macOS Tahoe (coming soon)",
         ]
         combo = ttk.Combobox(win, textvariable=os_var, values=os_options, state="readonly", font=("Consolas", 10))
         combo.pack(fill="x", padx=14, pady=6)
@@ -2699,6 +2812,18 @@ class App:
 
         def apply_setup():
             choice = os_var.get()
+            if not str(choice).lower().startswith("windows"):
+                messagebox.showinfo(
+                    "Coming Soon",
+                    "Linux and macOS setup profiles are coming soon. Windows is the only active target today.",
+                )
+                self.open_installation_guide()
+                self._set_status(f"{choice} profile coming soon")
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                return
             langs = self._recommended_languages_for_os(choice)
             self.open_polyglot_setup(selected_tokens=langs)
             self.open_installation_guide()
@@ -2764,6 +2889,10 @@ class App:
         )
         text.pack(side="top", fill="both", expand=True, padx=12, pady=(0, 10))
 
+        framework_note = PLUGIN_FRAMEWORK_PATH
+        if not os.path.isdir(PLUGIN_FRAMEWORK_PATH):
+            framework_note = f"{PLUGIN_FRAMEWORK_PATH} (not found - clone separately)"
+
         guide = f"""Welcome to RoadGIS Pro.
 
 This guide appears on first launch and can always be reopened from:
@@ -2776,7 +2905,7 @@ Tools > Open Installation Guide
 - Open Plugins > Plugin Manager and enable desired plugins
 
 2) Where plugin framework lives
-- Framework path: {PLUGIN_FRAMEWORK_PATH}
+- Framework path: {framework_note}
 - Clone/share this framework so contributors can build Go/Rust plugins quickly.
 
 3) Platform installer targets
@@ -2785,7 +2914,7 @@ Tools > Open Installation Guide
 - macOS Sonoma/Sequoia/Tahoe: coming soon
 
 4) Build installer helper
-- Use Tools > Build Installers for platform-specific commands.
+- Use Tools > Build Installers for Windows .exe/.msi build instructions.
 
 5) Diagnostics
 - Runtime config: {POLYGLOT_RUNTIME_CONFIG}
@@ -2835,25 +2964,35 @@ Tools > Open Installation Guide
         ).pack(side="left", padx=6)
 
     def open_installer_builder_info(self):
-        packaging_dir = os.path.join(PLUGIN_FRAMEWORK_PATH, "packaging")
+        packaging_dir = os.path.join(BASE_DIR, "installer", "windows-exe")
+        if not os.path.isdir(packaging_dir):
+            messagebox.showwarning(
+                "Build Installers",
+                "Installer build folder not found.\n"
+                "Expected:\n"
+                f"{packaging_dir}\n\n"
+                "Add the Windows installer scripts to your repo to enable EXE/MSI builds.",
+            )
+            return
         msg = (
-            "Installer build scripts are in the plugin framework packaging folder:\n\n"
+            "Windows installer build scripts live here:\n\n"
             f"{packaging_dir}\n\n"
             "Targets:\n"
-            "- Windows 11: .exe and .msi workflow scripts\n"
-            "- Debian Linux: .deb workflow script\n"
-            "- macOS Sonoma/Sequoia/Tahoe: app/pkg workflow script\n\n"
-            "Run the relevant script for your OS in a terminal."
+            "- Windows 11: .exe and .msi workflow scripts (active)\n"
+            "- Debian Linux: coming soon\n"
+            "- macOS Sonoma/Sequoia/Tahoe: coming soon\n\n"
+            "Run the Windows build script in a terminal."
         )
         messagebox.showinfo("Build Installers", msg)
 
     def _default_plugin_manifests(self):
-        if not os.path.isdir(PLUGIN_MANIFESTS_DIR):
-            return []
         manifests = []
-        for name in sorted(os.listdir(PLUGIN_MANIFESTS_DIR)):
-            if name.lower().endswith(".json"):
-                manifests.append(os.path.join(PLUGIN_MANIFESTS_DIR, name))
+        for base in PLUGIN_MANIFESTS_DIRS:
+            if not os.path.isdir(base):
+                continue
+            for name in sorted(os.listdir(base)):
+                if name.lower().endswith(".json"):
+                    manifests.append(os.path.join(base, name))
         return manifests
 
     def _normalize_plugin_entry(self, entry, default_enabled=False):
@@ -2901,11 +3040,12 @@ Tools > Open Installation Guide
             s = s.replace("{{BASE_DIR}}", BASE_DIR)
             s = s.replace("{{POLYGLOT_DIR}}", POLYGLOT_DIR)
             s = s.replace("{{PLUGIN_DIR}}", PLUGIN_DIR)
+            s = s.replace("{{INSTALL_PLUGIN_DIR}}", INSTALL_PLUGIN_DIR)
             expanded.append(s)
         return expanded
 
     def _load_plugins_registry(self):
-        os.makedirs(PLUGIN_DIR, exist_ok=True)
+        os.makedirs(USER_PLUGIN_DIR, exist_ok=True)
         plugins = []
         if os.path.exists(PLUGIN_REGISTRY_PATH):
             try:
@@ -2932,7 +3072,7 @@ Tools > Open Installation Guide
         self._save_plugins_registry()
 
     def _save_plugins_registry(self):
-        os.makedirs(PLUGIN_DIR, exist_ok=True)
+        os.makedirs(USER_PLUGIN_DIR, exist_ok=True)
         try:
             with open(PLUGIN_REGISTRY_PATH, "w", encoding="utf-8") as f:
                 json.dump(self._plugins, f, indent=2)
@@ -3789,6 +3929,7 @@ Tools > Open Installation Guide
         self.roads     = {}
         self.connectors = []
         self.structures = []
+        self._drive_index_dirty = True
         self._pending_connector = None
         self.current   = []
         self.selected  = None
@@ -3831,8 +3972,30 @@ Tools > Open Installation Guide
         self._status_var.set(msg)
 
 
+def _launch_app():
+    try:
+        root = tk.Tk()
+        App(root)
+        root.mainloop()
+    except Exception as ex:
+        try:
+            os.makedirs(USER_DATA_DIR, exist_ok=True)
+            with open(APP_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("Fatal startup error:\n")
+                f.write(str(ex) + "\n")
+                f.write(traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(
+                "RoadGISPro Startup Error",
+                "RoadGISPro failed to start.\n\n"
+                f"Details were written to:\n{APP_LOG_PATH}",
+            )
+        except Exception:
+            print("RoadGISPro failed to start. See log:", APP_LOG_PATH)
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    _launch_app()
 
