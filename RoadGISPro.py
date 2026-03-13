@@ -23,6 +23,7 @@ import urllib.request
 import re
 import threading
 from queue import Queue, Empty
+import zipfile
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -176,6 +177,15 @@ DRIVE_LANE_WIDTH_M = 3.4
 DRIVE_MAX_LANE_OFFSET = 9.0
 DRIVE_VIEW_DIST = 380.0
 DRIVE_INDEX_CELL = 160.0
+AUTOSAVE_INTERVAL_SEC = 180
+AUTOSAVE_MAX_FILES = 6
+
+OSM_PRESETS = {
+    "City": {"radius_km": 15, "est_mb": 8},
+    "County": {"radius_km": 45, "est_mb": 25},
+    "Metro": {"radius_km": 80, "est_mb": 60},
+}
+OSM_PRESET_DEFAULT = "City"
 
 MAP_BG      = "#1a2030"
 DARK_BG     = "#111520"
@@ -431,6 +441,7 @@ class App:
         self._drive_speed   = 0.0
         self._drive_lane_offset = 0.0
         self._drive_elev = 0.0
+        self._drive_fps_smooth = 0.0
         self._drive_seg_index = None
         self._drive_struct_index = None
         self._drive_index_dirty = True
@@ -438,6 +449,7 @@ class App:
         self._osm_cancel_event = None
         self._osm_queue = None
         self._osm_progress_win = None
+        self._osm_active_preset = None
         self._plugins       = []
         self._plugin_manager_win = None
         self._runtime_cfg = self._load_runtime_config()
@@ -456,6 +468,7 @@ class App:
         self.redraw()
         self.root.after(200, self._maybe_show_first_launch_guide)
         self.root.after(1200, self._maybe_check_for_updates)
+        self.root.after(AUTOSAVE_INTERVAL_SEC * 1000, self._autosave_tick)
 
     def _build_menu(self):
         mb = tk.Menu(
@@ -520,6 +533,7 @@ class App:
             ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
             ("Polyglot Setup (OS/Languages)", self.open_polyglot_setup),
             ("Open Installation Guide", self.open_installation_guide),
+            ("Report Issue (Create Zip)", self.report_issue_bundle),
             ("Check for Updates", lambda: self._maybe_check_for_updates(force=True)),
             ("Build Installers", self.open_installer_builder_info),
         ])
@@ -2259,6 +2273,11 @@ class App:
         else:
             dt = max(0.005, min(0.05, now - self._drive_last_tick))
         self._drive_last_tick = now
+        inst_fps = 1.0 / max(dt, 0.001)
+        if self._drive_fps_smooth <= 0:
+            self._drive_fps_smooth = inst_fps
+        else:
+            self._drive_fps_smooth = self._drive_fps_smooth * 0.9 + inst_fps * 0.1
 
         throttle = (1 if "w" in self._drive_keys else 0) - (1 if "s" in self._drive_keys else 0)
         steer = (1 if "d" in self._drive_keys else 0) - (1 if "a" in self._drive_keys else 0)
@@ -2476,9 +2495,14 @@ class App:
                       text=f"Speed: {speed_kmh:5.1f} km/h")
         c.create_text(14, 34, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
                       text="Controls: W/S throttle, A/D steer, Arrow keys supported | Ramps + lane-aware roads")
+        seg_count = len(seg_draw)
+        b_count = len(b_draw)
+        fps = self._drive_fps_smooth
+        c.create_text(14, 54, anchor="nw", fill="#86a2d0", font=("Consolas", 9),
+                      text=f"Diagnostics: {fps:4.0f} fps | segs {seg_count} | buildings {b_count} | view {int(DRIVE_VIEW_DIST)}m")
         if nearest:
             _sx, _sy, _ang, road, dist = nearest
-            c.create_text(14, 54, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
+            c.create_text(14, 74, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
                           text=f"Road: {road.name or 'Unnamed'} | L{int(road.bridge_level)} | offset {dist:.1f}")
 
     def apply(self):
@@ -3162,6 +3186,38 @@ Tools > Open Installation Guide
         )
         messagebox.showinfo("Build Installers", msg)
 
+    def report_issue_bundle(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("ZIP", "*.zip")],
+            title="Save Issue Bundle",
+        )
+        if not path:
+            return
+        include_layer = messagebox.askyesno(
+            "Include Current Layer",
+            "Include the current layer snapshot in the report bundle?",
+        )
+        info = {
+            "app_version": APP_VERSION,
+            "os": platform.platform(),
+            "python": platform.python_version(),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for src in [APP_LOG_PATH, APP_STATE_PATH, POLYGLOT_RUNTIME_CONFIG, PLUGIN_REGISTRY_PATH]:
+                    if os.path.exists(src):
+                        zf.write(src, arcname=os.path.basename(src))
+                zf.writestr("system_info.json", json.dumps(info, indent=2))
+                if include_layer and self.roads:
+                    payload = self._current_layer_payload()
+                    zf.writestr("layer_snapshot.rgis", encode_rgis(payload))
+            messagebox.showinfo("Report Issue", f"Issue bundle saved:\n{path}")
+        except OSError as ex:
+            self._log_exception("Failed to create issue bundle", ex, context=path)
+            messagebox.showerror("Report Issue", "Failed to create issue bundle. See roadgis.log.")
+
     def _default_plugin_manifests(self):
         manifests = []
         for base in PLUGIN_MANIFESTS_DIRS:
@@ -3420,6 +3476,15 @@ Tools > Open Installation Guide
             ).pack(side="left", padx=4)
         self._refresh_plugin_manager_list()
 
+    def _disable_plugin(self, plugin, reason):
+        if not plugin.get("enabled", False):
+            return
+        plugin["enabled"] = False
+        self._save_plugins_registry()
+        self._refresh_plugin_manager_list()
+        self._set_status(f"Plugin disabled: {plugin.get('name', plugin.get('id'))} ({reason})")
+        self._log("WARN", f"Plugin disabled: {reason}", context=plugin.get("id"))
+
     def _run_plugin_process(self, plugin, payload):
         cmd = self._expand_command_tokens(plugin.get("command", []))
         timeout = plugin.get("timeout", 6)
@@ -3445,6 +3510,7 @@ Tools > Open Installation Guide
             if isinstance(result, dict):
                 outputs.append(result)
             else:
+                self._disable_plugin(plugin, "execution failed or timed out")
                 errors.append({
                     "plugin_id": plugin.get("id"),
                     "plugin_name": plugin.get("name"),
@@ -3645,21 +3711,86 @@ Tools > Open Installation Guide
         return cleaned[:64] or "osm_area"
 
     def open_osm_download_dialog(self):
-        area = simpledialog.askstring(
-            "OSM Mode",
-            "What area do you want to download for offline analysis?\nExamples: Dallas, Tokyo, Berlin",
-            parent=self.root,
-        )
-        if not area:
-            return
-        if not self._ask_save():
-            return
-        self._start_osm_download_job(area)
+        win = tk.Toplevel(self.root)
+        win.title("OSM Mode")
+        win.geometry("520x240")
+        win.configure(bg=DARK_BG)
+        win.minsize(420, 220)
+        win.grab_set()
 
-    def _start_osm_download_job(self, area):
+        tk.Label(
+            win,
+            text="Download OSM for Offline Analysis",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 12, "bold"),
+            pady=8,
+        ).pack(fill="x")
+
+        area_var = tk.StringVar()
+        preset_var = tk.StringVar(value=OSM_PRESET_DEFAULT)
+        estimate_var = tk.StringVar(value="")
+
+        tk.Label(win, text="Area (city, region, or landmark):", bg=DARK_BG, fg=PANEL_FG,
+                 font=("Consolas", 9)).pack(fill="x", padx=12)
+        tk.Entry(win, textvariable=area_var, bg=INPUT_BG, fg=PANEL_FG,
+                 insertbackground=PANEL_FG, relief="flat").pack(fill="x", padx=12, pady=(4, 8))
+
+        tk.Label(win, text="Preset size:", bg=DARK_BG, fg=PANEL_FG,
+                 font=("Consolas", 9)).pack(fill="x", padx=12)
+        preset_box = ttk.Combobox(
+            win, textvariable=preset_var,
+            values=list(OSM_PRESETS.keys()),
+            state="readonly",
+            font=("Consolas", 9),
+        )
+        preset_box.pack(fill="x", padx=12, pady=(4, 6))
+
+        def update_estimate(*_):
+            info = OSM_PRESETS.get(preset_var.get(), {})
+            est_mb = info.get("est_mb", "?")
+            radius = info.get("radius_km", "?")
+            estimate_var.set(f"Estimated download: ~{est_mb} MB | Approx radius: {radius} km")
+
+        preset_box.bind("<<ComboboxSelected>>", update_estimate)
+        update_estimate()
+
+        tk.Label(win, textvariable=estimate_var, bg=DARK_BG, fg="#9fb3d8",
+                 font=("Consolas", 9)).pack(fill="x", padx=12, pady=(0, 6))
+
+        btns = tk.Frame(win, bg=DARK_BG)
+        btns.pack(fill="x", padx=12, pady=(6, 10))
+
+        def start():
+            area = area_var.get().strip()
+            if not area:
+                messagebox.showwarning("OSM Mode", "Please enter an area name.")
+                return
+            if not self._ask_save():
+                return
+            preset = preset_var.get()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self._start_osm_download_job(area, preset)
+
+        tk.Button(
+            btns, text="Download", command=start,
+            bg=ACCENT, fg="white", relief="flat", bd=0,
+            padx=10, pady=5, font=("Consolas", 9, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            btns, text="Cancel", command=win.destroy,
+            bg="#3e4f74", fg="white", relief="flat", bd=0,
+            padx=10, pady=5, font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=8)
+
+    def _start_osm_download_job(self, area, preset=None):
         self._osm_cancel_event = threading.Event()
         self._osm_queue = Queue()
-        self._set_status(f"OSM download started for '{area}'")
+        self._osm_active_preset = preset or OSM_PRESET_DEFAULT
+        self._set_status(f"OSM download started for '{area}' ({self._osm_active_preset})")
 
         def worker():
             try:
@@ -3688,8 +3819,17 @@ Tools > Open Installation Guide
         win.configure(bg=DARK_BG)
         win.minsize(420, 140)
         self._osm_progress_win = win
-        tk.Label(win, text=f"Downloading OSM area: {area}", bg=DARK_BG, fg=ACCENT,
-                 font=("Consolas", 11, "bold"), pady=8).pack(fill="x")
+        preset = self._osm_active_preset or OSM_PRESET_DEFAULT
+        info = OSM_PRESETS.get(preset, {})
+        est_mb = info.get("est_mb", "?")
+        tk.Label(
+            win,
+            text=f"Downloading OSM area: {area}  |  {preset} (~{est_mb} MB)",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 11, "bold"),
+            pady=8,
+        ).pack(fill="x")
         self._osm_progress_var = tk.StringVar(value="Starting...")
         tk.Label(win, textvariable=self._osm_progress_var, bg=DARK_BG, fg=PANEL_FG,
                  font=("Consolas", 10)).pack(fill="x", padx=12, pady=8)
@@ -3902,14 +4042,17 @@ Tools > Open Installation Guide
             return self._write_file(path)
         return False
 
+    def _current_layer_payload(self):
+        return {
+            "roads": [r.to_dict() for r in self.roads.values()],
+            "connectors": self.connectors,
+            "structures": self.structures,
+        }
+
     def _write_file(self, path):
         tmp_path = f"{path}.tmp"
         try:
-            data = {
-                "roads": [r.to_dict() for r in self.roads.values()],
-                "connectors": self.connectors,
-                "structures": self.structures,
-            }
+            data = self._current_layer_payload()
             encoded = encode_rgis(data)
             with open(tmp_path, "wb") as f:
                 f.write(encoded)
@@ -3928,6 +4071,35 @@ Tools > Open Installation Guide
                 except OSError:
                     pass
 
+    def _autosave_tick(self):
+        try:
+            if self.dirty and self.roads:
+                self._write_autosave_snapshot()
+        except Exception as ex:
+            self._log_exception("Autosave failed", ex)
+        finally:
+            self.root.after(AUTOSAVE_INTERVAL_SEC * 1000, self._autosave_tick)
+
+    def _write_autosave_snapshot(self):
+        autosave_dir = os.path.join(USER_DATA_DIR, "autosaves")
+        os.makedirs(autosave_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(autosave_dir, f"autosave_{stamp}{FILE_EXT}")
+        data = self._current_layer_payload()
+        encoded = encode_rgis(data)
+        with open(path, "wb") as f:
+            f.write(encoded)
+        snaps = sorted(
+            [p for p in os.listdir(autosave_dir) if p.lower().endswith(FILE_EXT)],
+            key=lambda n: n,
+        )
+        while len(snaps) > AUTOSAVE_MAX_FILES:
+            old = snaps.pop(0)
+            try:
+                os.remove(os.path.join(autosave_dir, old))
+            except OSError:
+                break
+
     def export_json(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
@@ -3937,11 +4109,7 @@ Tools > Open Installation Guide
         if not path:
             return
         try:
-            payload = {
-                "roads": [r.to_dict() for r in self.roads.values()],
-                "connectors": self.connectors,
-                "structures": self.structures,
-            }
+            payload = self._current_layer_payload()
             metrics = self._compute_metrics_polyglot(payload)
             plugin_payload = {
                 "roads": payload["roads"],
