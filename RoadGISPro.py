@@ -46,7 +46,10 @@ def _resolve_user_data_dir():
 
 BASE_DIR = _resolve_base_dir()
 USER_DATA_DIR = _resolve_user_data_dir()
-os.makedirs(USER_DATA_DIR, exist_ok=True)
+try:
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+except OSError:
+    pass
 
 POLYGLOT_DIR = os.path.join(BASE_DIR, "polyglot")
 INSTALL_PLUGIN_DIR = os.path.join(POLYGLOT_DIR, "plugins")
