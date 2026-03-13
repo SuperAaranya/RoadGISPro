@@ -17,6 +17,7 @@ import subprocess
 import traceback
 import platform
 from datetime import datetime
+import tempfile
 import urllib.parse
 import urllib.request
 import re
@@ -28,6 +29,8 @@ FILE_VERSION = 1
 FILE_EXT     = ".rgis"
 FILE_KEY     = b"RoadGISPro\x7f\x3a\x91\xb4\x2d\xe0\x55\xc8"
 APP_TITLE    = "RoadGIS Pro"
+APP_VERSION  = "1.0.0"
+UPDATE_REPO  = "SuperAaranya/RoadGISPro"
 
 
 def _resolve_base_dir():
@@ -452,6 +455,7 @@ class App:
         self._bind_keys()
         self.redraw()
         self.root.after(200, self._maybe_show_first_launch_guide)
+        self.root.after(1200, self._maybe_check_for_updates)
 
     def _build_menu(self):
         mb = tk.Menu(
@@ -516,6 +520,7 @@ class App:
             ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
             ("Polyglot Setup (OS/Languages)", self.open_polyglot_setup),
             ("Open Installation Guide", self.open_installation_guide),
+            ("Check for Updates", lambda: self._maybe_check_for_updates(force=True)),
             ("Build Installers", self.open_installer_builder_info),
         ])
 
@@ -2720,6 +2725,8 @@ class App:
         state = {
             "first_launch_completed": False,
             "first_launch_shown_at": None,
+            "last_update_check": None,
+            "last_update_prompted": None,
         }
         if os.path.exists(APP_STATE_PATH):
             try:
@@ -2739,6 +2746,173 @@ class App:
                 json.dump(state, f, indent=2)
         except OSError as ex:
             self._log_exception("Failed to save app state", ex, context=APP_STATE_PATH)
+
+    def _parse_version(self, raw):
+        nums = re.findall(r"\d+", str(raw))
+        if not nums:
+            return (0,)
+        return tuple(int(n) for n in nums[:4])
+
+    def _maybe_check_for_updates(self, force=False):
+        state = self._load_app_state()
+        last = state.get("last_update_check")
+        if not force and last:
+            try:
+                then = datetime.fromisoformat(str(last))
+                if (datetime.now() - then).total_seconds() < 12 * 3600:
+                    return
+            except ValueError:
+                pass
+        state["last_update_check"] = datetime.now().isoformat(timespec="seconds")
+        self._save_app_state(state)
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _fetch_latest_release(self):
+        url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "RoadGISPro"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        tag = data.get("tag_name") or data.get("name") or ""
+        body = data.get("body") or ""
+        assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+        chosen = None
+        for asset in assets:
+            name = str(asset.get("name", ""))
+            if name.lower().endswith(".exe"):
+                chosen = asset
+                break
+        if not chosen:
+            for asset in assets:
+                name = str(asset.get("name", ""))
+                if name.lower().endswith(".msi"):
+                    chosen = asset
+                    break
+        return {
+            "tag": str(tag),
+            "name": str(data.get("name") or tag),
+            "body": str(body),
+            "asset": chosen,
+        }
+
+    def _check_for_updates_worker(self):
+        try:
+            latest = self._fetch_latest_release()
+        except Exception as ex:
+            self._log_exception("Update check failed", ex, context="github")
+            return
+        if not latest:
+            return
+        current_v = self._parse_version(APP_VERSION)
+        latest_v = self._parse_version(latest.get("tag") or latest.get("name"))
+        if latest_v <= current_v:
+            return
+        self.root.after(0, lambda: self._show_update_dialog(latest))
+
+    def _show_update_dialog(self, latest):
+        win = tk.Toplevel(self.root)
+        win.title("Update Available")
+        win.geometry("720x520")
+        win.configure(bg=DARK_BG)
+        win.minsize(620, 420)
+        win.grab_set()
+
+        title = tk.Label(
+            win,
+            text=f"New version available: {latest.get('name', '')}",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        )
+        title.pack(fill="x")
+
+        notes = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 9),
+            padx=12,
+            pady=12,
+        )
+        notes.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        body = latest.get("body") or "Release notes are not available."
+        notes.insert("1.0", body)
+        notes.config(state="disabled")
+
+        btn_bar = tk.Frame(win, bg=DARK_BG)
+        btn_bar.pack(fill="x", padx=12, pady=(0, 12))
+
+        def install():
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self._download_and_launch_update(latest)
+
+        tk.Button(
+            btn_bar,
+            text="Install Update",
+            command=install,
+            bg=ACCENT,
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            btn_bar,
+            text="Later",
+            command=win.destroy,
+            bg="#3e4f74",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=8)
+
+    def _download_and_launch_update(self, latest):
+        asset = latest.get("asset")
+        if not isinstance(asset, dict) or not asset.get("browser_download_url"):
+            messagebox.showerror(
+                "Update",
+                "No installer asset was found in the latest GitHub release.",
+            )
+            return
+        url = asset["browser_download_url"]
+        name = asset.get("name") or "RoadGISProSetup.exe"
+        target = os.path.join(tempfile.gettempdir(), name)
+
+        def worker():
+            try:
+                self._set_status("Downloading update installer...")
+                urllib.request.urlretrieve(url, target)
+            except Exception as ex:
+                self._log_exception("Update download failed", ex, context=url)
+                self.root.after(0, lambda: messagebox.showerror("Update", "Download failed. See roadgis.log."))
+                return
+            self.root.after(0, lambda: self._launch_installer(target))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_installer(self, path):
+        try:
+            subprocess.Popen([path])
+        except OSError as ex:
+            self._log_exception("Failed to launch installer", ex, context=path)
+            messagebox.showerror("Update", f"Could not launch installer:\n{path}")
+            return
+        if self._ask_save():
+            self.on_close()
 
     def _maybe_show_first_launch_guide(self):
         state = self._load_app_state()
