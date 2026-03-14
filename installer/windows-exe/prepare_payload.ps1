@@ -1,5 +1,6 @@
 param(
-    [Parameter(Mandatory = $true)][string]$RepoRoot
+    [Parameter(Mandatory = $true)][string]$RepoRoot,
+    [string]$PythonExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +25,34 @@ if (-not (Test-Path $appEntry)) {
 Write-Host "[1/4] Building RoadGISPro executable with PyInstaller..."
 Push-Location $RepoRoot
 try {
-    & py -m PyInstaller --noconfirm --clean --windowed --onedir --name "RoadGISPro" `
+    function Resolve-PythonExe {
+        if ($PythonExe) {
+            return $PythonExe
+        }
+        $py = Get-Command python -ErrorAction SilentlyContinue
+        if ($py) {
+            return $py.Source
+        }
+        $launcher = Get-Command py -ErrorAction SilentlyContinue
+        if ($launcher) {
+            return "py"
+        }
+        throw "Python not found. Install Python 3.x or pass -PythonExe."
+    }
+
+    $python = Resolve-PythonExe
+    $pyinstallerOk = $true
+    try {
+        & $python -m PyInstaller --version | Out-Null
+    } catch {
+        $pyinstallerOk = $false
+    }
+    if (-not $pyinstallerOk) {
+        Write-Host "PyInstaller not found. Installing..."
+        & $python -m pip install pyinstaller
+    }
+
+    & $python -m PyInstaller --noconfirm --clean --windowed --onedir --name "RoadGISPro" `
         --distpath $pyiDist --workpath $pyiBuild --specpath $workRoot $appEntry
 } finally {
     Pop-Location

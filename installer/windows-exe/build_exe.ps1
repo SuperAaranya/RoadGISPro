@@ -1,6 +1,7 @@
 param(
     [string]$Version = "1.0.0",
-    [string]$RepoRoot
+    [string]$RepoRoot,
+    [string]$PythonExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,7 +21,7 @@ if (-not (Test-Path $issFile)) {
 }
 
 Write-Host "Preparing payload..."
-& (Join-Path $PSScriptRoot "prepare_payload.ps1") -RepoRoot $repoRoot
+& (Join-Path $PSScriptRoot "prepare_payload.ps1") -RepoRoot $repoRoot -PythonExe $PythonExe
 
 if (-not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null

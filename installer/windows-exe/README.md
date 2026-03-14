@@ -41,6 +41,9 @@ powershell -ExecutionPolicy Bypass -File ".\installer\windows-exe\build_exe.ps1"
 
 Note: run this from a normal (non-admin) PowerShell window. PyInstaller blocks admin/system32 builds.
 
+CI/GitHub Actions: if PyInstaller is missing, the script will install it automatically using the Python on PATH.
+If you need a specific Python, pass `-PythonExe "C:\path\to\python.exe"`.
+
 Output:
 
 - `installer/windows-exe/out/RoadGISProSetup-<version>.exe`

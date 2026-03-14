@@ -20,6 +20,7 @@ from datetime import datetime
 import tempfile
 import urllib.parse
 import urllib.request
+import webbrowser
 import re
 import threading
 from queue import Queue, Empty
@@ -33,6 +34,10 @@ APP_TITLE    = "RoadGIS Pro"
 APP_VERSION  = "1.0.0"
 UPDATE_REPO  = "SuperAaranya/RoadGISPro"
 UPDATE_RELEASE_TAG = "nightly"
+PLUGIN_LIBRARY_URL = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/plugins.json"
+PLUGIN_LIBRARY_SITE = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/"
+PLUGIN_LIBRARY_TIMEOUT = 12
+PLUGIN_LIBRARY_CACHE_NAME = "plugin_library_cache.json"
 
 
 def _resolve_base_dir():
@@ -81,6 +86,7 @@ POLYGLOT_RUNTIME_CONFIG = os.path.join(USER_DATA_DIR, "runtime_config.json")
 POLYGLOT_SETUP_SCRIPT = os.path.join(POLYGLOT_DIR, "setup", "setup_languages.py")
 APP_LOG_PATH = os.path.join(USER_DATA_DIR, "roadgis.log")
 APP_STATE_PATH = os.path.join(USER_DATA_DIR, ".roadgis_state.json")
+PLUGIN_LIBRARY_CACHE = os.path.join(USER_DATA_DIR, PLUGIN_LIBRARY_CACHE_NAME)
 PLUGIN_FRAMEWORK_PATH = os.path.abspath(
     os.path.join(BASE_DIR, "..", "..", "..", "Frameworks", "RoadGIS-Plugin-Framework")
 )
@@ -453,6 +459,8 @@ class App:
         self._osm_active_preset = None
         self._plugins       = []
         self._plugin_manager_win = None
+        self._plugin_library_win = None
+        self._plugin_library_entries = []
         self._runtime_cfg = self._load_runtime_config()
 
         root.title(APP_TITLE)
@@ -531,6 +539,7 @@ class App:
 
         menu("Tools", [
             ("Validate Layer File", self.validate_layer_file_dialog),
+            ("Layer Insights Dashboard", self.open_layer_insights),
             ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
             ("Polyglot Setup (OS/Languages)", self.open_polyglot_setup),
             ("Open Installation Guide", self.open_installation_guide),
@@ -540,6 +549,7 @@ class App:
         ])
 
         menu("Plugins", [
+            ("Plugin Library (Online)", self.open_plugin_library),
             ("Plugin Manager", self.open_plugin_manager),
             ("Reload Plugin Registry", self._reload_plugins_registry),
             ("Install Built-in Plugins", self.install_builtin_plugins),
@@ -2753,6 +2763,8 @@ class App:
             "last_update_check": None,
             "last_update_prompted": None,
             "last_update_asset_sig": None,
+            "plugin_library_url": None,
+            "plugin_library_last_refresh": None,
         }
         if os.path.exists(APP_STATE_PATH):
             try:
@@ -2772,6 +2784,183 @@ class App:
                 json.dump(state, f, indent=2)
         except OSError as ex:
             self._log_exception("Failed to save app state", ex, context=APP_STATE_PATH)
+
+    def _get_plugin_library_url(self):
+        state = self._load_app_state()
+        url = state.get("plugin_library_url") or PLUGIN_LIBRARY_URL
+        url = str(url).strip()
+        return url or PLUGIN_LIBRARY_URL
+
+    def _set_plugin_library_url(self, url):
+        state = self._load_app_state()
+        state["plugin_library_url"] = url
+        state["plugin_library_last_refresh"] = datetime.now().isoformat(timespec="seconds")
+        self._save_app_state(state)
+
+    def _load_plugin_library_cache(self):
+        if not os.path.exists(PLUGIN_LIBRARY_CACHE):
+            return None
+        try:
+            with open(PLUGIN_LIBRARY_CACHE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if isinstance(cached, dict) and isinstance(cached.get("plugins"), list):
+                return cached
+        except (OSError, json.JSONDecodeError) as ex:
+            self._log_exception("Failed to load plugin library cache", ex, context=PLUGIN_LIBRARY_CACHE)
+        return None
+
+    def _save_plugin_library_cache(self, data):
+        try:
+            os.makedirs(USER_DATA_DIR, exist_ok=True)
+            with open(PLUGIN_LIBRARY_CACHE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as ex:
+            self._log_exception("Failed to save plugin library cache", ex, context=PLUGIN_LIBRARY_CACHE)
+
+    def _normalize_library_entry(self, entry, base_url):
+        if not isinstance(entry, dict):
+            return None
+        plugin_id = str(entry.get("id", "")).strip()
+        name = str(entry.get("name", "")).strip()
+        if not plugin_id or not name:
+            return None
+        description = str(entry.get("description", "")).strip()
+        language = str(entry.get("language", "")).strip().lower()
+        version = str(entry.get("version", "1.0.0")).strip() or "1.0.0"
+        tags = entry.get("tags") if isinstance(entry.get("tags"), list) else []
+        tags = [str(t).strip() for t in tags if str(t).strip()]
+        pack_url = str(entry.get("pack_url") or entry.get("download") or "").strip()
+        if pack_url:
+            pack_url = urllib.parse.urljoin(base_url, pack_url)
+        homepage = str(entry.get("homepage") or entry.get("repo") or "").strip()
+        if homepage:
+            homepage = urllib.parse.urljoin(base_url, homepage) if homepage.startswith("./") else homepage
+        min_app = str(entry.get("min_app_version") or "").strip()
+        max_app = str(entry.get("max_app_version") or "").strip()
+        sha256 = str(entry.get("sha256") or "").strip()
+        size_bytes = entry.get("size_bytes")
+        return {
+            "id": plugin_id,
+            "name": name,
+            "description": description,
+            "language": language,
+            "version": version,
+            "tags": tags,
+            "pack_url": pack_url,
+            "homepage": homepage,
+            "min_app_version": min_app,
+            "max_app_version": max_app,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }
+
+    def _compatible_with_app(self, entry):
+        min_app = entry.get("min_app_version")
+        max_app = entry.get("max_app_version")
+        current = self._parse_version(APP_VERSION)
+        if min_app:
+            if current < self._parse_version(min_app):
+                return False
+        if max_app:
+            if current > self._parse_version(max_app):
+                return False
+        return True
+
+    def _fetch_plugin_library(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": "RoadGISPro"})
+        try:
+            with urllib.request.urlopen(req, timeout=PLUGIN_LIBRARY_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8")
+        except Exception as ex:
+            return None, f"Library download failed: {ex}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None, "Library JSON is invalid."
+        if isinstance(data, list):
+            plugins = data
+            meta = {"generated_at": None, "source": url}
+        elif isinstance(data, dict):
+            plugins = data.get("plugins") if isinstance(data.get("plugins"), list) else []
+            meta = {
+                "generated_at": data.get("generated_at"),
+                "source": data.get("source") or url,
+            }
+        else:
+            return None, "Library payload was not a JSON object."
+        base_url = url.rsplit("/", 1)[0] + "/"
+        normalized = []
+        for entry in plugins:
+            norm = self._normalize_library_entry(entry, base_url)
+            if norm:
+                normalized.append(norm)
+        return {"plugins": normalized, "meta": meta}, None
+
+    def _is_plugin_installed(self, plugin_id):
+        for plugin in self._plugins:
+            if plugin.get("id") == plugin_id:
+                return True
+        return False
+
+    def _enable_plugins_by_id(self, plugin_ids):
+        changed = False
+        for plugin in self._plugins:
+            if plugin.get("id") in plugin_ids:
+                if not plugin.get("enabled", False):
+                    plugin["enabled"] = True
+                    changed = True
+        if changed:
+            self._save_plugins_registry()
+            self._refresh_plugin_manager_list()
+
+    def _install_plugin_pack(self, pack_path):
+        temp_root = tempfile.mkdtemp(prefix="roadgis_pack_")
+        installed = []
+        try:
+            with zipfile.ZipFile(pack_path, "r") as zf:
+                zf.extractall(temp_root)
+            plugins_root = os.path.join(temp_root, "plugins")
+            manifests_root = os.path.join(temp_root, "manifests")
+            if os.path.isdir(plugins_root):
+                plugin_ids = [d for d in os.listdir(plugins_root) if os.path.isdir(os.path.join(plugins_root, d))]
+            else:
+                plugin_ids = [d for d in os.listdir(temp_root) if os.path.isdir(os.path.join(temp_root, d))]
+            if not plugin_ids:
+                raise ValueError("No plugin folders found in the plugin pack.")
+            os.makedirs(USER_PLUGIN_DIR, exist_ok=True)
+            manifests_out = os.path.join(USER_PLUGIN_DIR, "manifests")
+            os.makedirs(manifests_out, exist_ok=True)
+            for pid in plugin_ids:
+                src_dir = os.path.join(plugins_root, pid) if os.path.isdir(plugins_root) else os.path.join(temp_root, pid)
+                if not os.path.isdir(src_dir):
+                    continue
+                dest_dir = os.path.join(USER_PLUGIN_DIR, pid)
+                if os.path.exists(dest_dir):
+                    if not messagebox.askyesno("Overwrite Plugin", f"Plugin '{pid}' already exists. Replace it?"):
+                        continue
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+                shutil.copytree(src_dir, dest_dir)
+                installed.append(pid)
+            manifest_paths = []
+            if os.path.isdir(manifests_root):
+                for name in os.listdir(manifests_root):
+                    if name.lower().endswith(".json"):
+                        manifest_paths.append(os.path.join(manifests_root, name))
+            else:
+                for root_dir, _, files in os.walk(temp_root):
+                    for name in files:
+                        if name.lower().endswith(".json"):
+                            manifest_paths.append(os.path.join(root_dir, name))
+            for manifest in manifest_paths:
+                base = os.path.basename(manifest)
+                if base.lower().endswith(".json"):
+                    shutil.copy(manifest, os.path.join(manifests_out, base))
+            return installed
+        finally:
+            try:
+                shutil.rmtree(temp_root, ignore_errors=True)
+            except OSError:
+                pass
 
     def _parse_version(self, raw):
         nums = re.findall(r"\d+", str(raw))
@@ -3152,6 +3341,7 @@ Tools > Open Installation Guide
 - Open Tools > Polyglot Setup (OS/Languages)
 - Select language engines you want enabled
 - Install built-in plugins via Plugins > Install Built-in Plugins
+- Browse Plugins > Plugin Library for online plugin packs
 - Open Plugins > Plugin Manager and enable desired plugins
 
 2) Where plugin framework lives
@@ -3525,6 +3715,330 @@ Tools > Open Installation Guide
             ).pack(side="left", padx=4)
         self._refresh_plugin_manager_list()
 
+    def open_plugin_library(self):
+        if self._plugin_library_win and self._plugin_library_win.winfo_exists():
+            self._plugin_library_win.lift()
+            self._plugin_library_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Plugin Library")
+        win.geometry("1100x640")
+        win.configure(bg=DARK_BG)
+        win.minsize(860, 520)
+        self._plugin_library_win = win
+
+        tk.Label(
+            win,
+            text="Plugin Library (GitHub Pages)",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        ).pack(fill="x")
+
+        top = tk.Frame(win, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER)
+        top.pack(fill="x", padx=10, pady=(0, 8))
+
+        url_var = tk.StringVar(value=self._get_plugin_library_url())
+        search_var = tk.StringVar(value="")
+        status_var = tk.StringVar(value="Ready")
+        meta_var = tk.StringVar(value="")
+
+        tk.Label(top, text="Library URL:", bg=PANEL_BG, fg=PANEL_FG,
+                 font=("Consolas", 9)).grid(row=0, column=0, padx=8, pady=6, sticky="w")
+        url_entry = tk.Entry(top, textvariable=url_var, bg=INPUT_BG, fg=PANEL_FG,
+                             insertbackground=PANEL_FG, relief="flat", font=("Consolas", 9))
+        url_entry.grid(row=0, column=1, padx=6, pady=6, sticky="we")
+        top.grid_columnconfigure(1, weight=1)
+
+        def open_site():
+            url = url_var.get().strip()
+            if url:
+                base = url.rsplit("/", 1)[0] + "/"
+                webbrowser.open(base)
+            else:
+                webbrowser.open(PLUGIN_LIBRARY_SITE)
+
+        def save_url():
+            url = url_var.get().strip()
+            if not url:
+                messagebox.showwarning("Plugin Library", "Library URL cannot be blank.")
+                return
+            self._set_plugin_library_url(url)
+            status_var.set("Library URL saved.")
+
+        tk.Button(
+            top, text="Open Site", command=open_site,
+            bg="#3d6fa3", fg="white", relief="flat", bd=0,
+            font=("Consolas", 9, "bold"), padx=10, pady=5, cursor="hand2",
+        ).grid(row=0, column=2, padx=6, pady=6)
+        tk.Button(
+            top, text="Save URL", command=save_url,
+            bg="#3f8b5f", fg="white", relief="flat", bd=0,
+            font=("Consolas", 9, "bold"), padx=10, pady=5, cursor="hand2",
+        ).grid(row=0, column=3, padx=(0, 6), pady=6)
+
+        tk.Label(top, text="Search:", bg=PANEL_BG, fg=PANEL_FG,
+                 font=("Consolas", 9)).grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        search_entry = tk.Entry(top, textvariable=search_var, bg=INPUT_BG, fg=PANEL_FG,
+                                insertbackground=PANEL_FG, relief="flat", font=("Consolas", 9))
+        search_entry.grid(row=1, column=1, padx=6, pady=6, sticky="we")
+        tk.Button(
+            top, text="Refresh", command=lambda: refresh_library(),
+            bg=ACCENT, fg="white", relief="flat", bd=0,
+            font=("Consolas", 9, "bold"), padx=10, pady=5, cursor="hand2",
+        ).grid(row=1, column=2, padx=6, pady=6)
+        tk.Label(top, textvariable=status_var, bg=PANEL_BG, fg="#aab8d8",
+                 font=("Consolas", 8)).grid(row=1, column=3, padx=(0, 8), pady=6, sticky="e")
+
+        body = tk.Frame(win, bg=DARK_BG)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        left = tk.Frame(body, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        cols = ("id", "name", "language", "version", "tags", "status")
+        tree = ttk.Treeview(left, columns=cols, show="headings", height=14)
+        tree.heading("id", text="ID")
+        tree.heading("name", text="Name")
+        tree.heading("language", text="Language")
+        tree.heading("version", text="Version")
+        tree.heading("tags", text="Tags")
+        tree.heading("status", text="Status")
+        tree.column("id", width=160, anchor="w")
+        tree.column("name", width=200, anchor="w")
+        tree.column("language", width=90, anchor="center")
+        tree.column("version", width=70, anchor="center")
+        tree.column("tags", width=170, anchor="w")
+        tree.column("status", width=90, anchor="center")
+        tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        right = tk.Frame(body, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER, width=320)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        tk.Label(right, text="Plugin Details", bg=PANEL_BG, fg=ACCENT,
+                 font=("Consolas", 10, "bold"), pady=8).pack(fill="x")
+        detail = tk.Text(
+            right,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            insertbackground=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 9),
+            padx=10,
+            pady=10,
+            height=18,
+        )
+        detail.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        detail.config(state="disabled")
+
+        meta = tk.Label(right, textvariable=meta_var, bg=PANEL_BG, fg="#7f8cad",
+                        font=("Consolas", 8))
+        meta.pack(fill="x", padx=8, pady=(0, 8))
+
+        btn_bar = tk.Frame(win, bg=DARK_BG)
+        btn_bar.pack(fill="x", padx=10, pady=(0, 12))
+
+        def update_tree(entries):
+            for item in tree.get_children():
+                tree.delete(item)
+            for entry in entries:
+                installed = self._is_plugin_installed(entry["id"])
+                status = "Installed" if installed else "Available"
+                if not self._compatible_with_app(entry):
+                    status = "Incompatible"
+                tags = ",".join(entry.get("tags", []))
+                tree.insert("", "end", values=(
+                    entry["id"],
+                    entry.get("name", ""),
+                    entry.get("language", ""),
+                    entry.get("version", ""),
+                    tags,
+                    status,
+                ))
+
+        def apply_details(entry):
+            if not entry:
+                detail.config(state="normal")
+                detail.delete("1.0", "end")
+                detail.insert("1.0", "Select a plugin to see details.")
+                detail.config(state="disabled")
+                return
+            lines = [
+                f"Name: {entry.get('name','')}",
+                f"ID: {entry.get('id','')}",
+                f"Language: {entry.get('language','')}",
+                f"Version: {entry.get('version','')}",
+                f"Compatible: {'Yes' if self._compatible_with_app(entry) else 'No'}",
+            ]
+            if entry.get("min_app_version"):
+                lines.append(f"Min App Version: {entry.get('min_app_version')}")
+            if entry.get("max_app_version"):
+                lines.append(f"Max App Version: {entry.get('max_app_version')}")
+            if entry.get("tags"):
+                lines.append(f"Tags: {', '.join(entry.get('tags', []))}")
+            if entry.get("size_bytes"):
+                lines.append(f"Pack Size: {entry.get('size_bytes')} bytes")
+            if entry.get("sha256"):
+                lines.append(f"SHA256: {entry.get('sha256')}")
+            if entry.get("description"):
+                lines.append("")
+                lines.append(entry.get("description"))
+            detail.config(state="normal")
+            detail.delete("1.0", "end")
+            detail.insert("1.0", "\n".join(lines))
+            detail.config(state="disabled")
+
+        def selected_entry():
+            sel = tree.selection()
+            if not sel:
+                return None
+            values = tree.item(sel[0], "values")
+            if not values:
+                return None
+            plugin_id = values[0]
+            for entry in self._plugin_library_entries:
+                if entry.get("id") == plugin_id:
+                    return entry
+            return None
+
+        def on_select(_):
+            apply_details(selected_entry())
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def refresh_library():
+            url = url_var.get().strip()
+            if not url:
+                messagebox.showwarning("Plugin Library", "Library URL cannot be blank.")
+                return
+            status_var.set("Fetching library...")
+            def worker():
+                data, err = self._fetch_plugin_library(url)
+                if err:
+                    cached = self._load_plugin_library_cache()
+                    if cached:
+                        data = cached
+                        err = f"{err} (loaded cached library)"
+                    else:
+                        data = None
+                def apply():
+                    if not data:
+                        messagebox.showerror("Plugin Library", err or "Failed to load library.")
+                        status_var.set("Failed to load library.")
+                        return
+                    self._save_plugin_library_cache(data)
+                    self._set_plugin_library_url(url)
+                    self._load_plugins_registry()
+                    self._plugin_library_entries = data.get("plugins", [])
+                    update_tree(self._plugin_library_entries)
+                    meta_info = data.get("meta", {}) if isinstance(data, dict) else {}
+                    meta_bits = []
+                    if meta_info.get("generated_at"):
+                        meta_bits.append(f"Updated {meta_info.get('generated_at')}")
+                    if meta_info.get("source"):
+                        meta_bits.append(f"Source: {meta_info.get('source')}")
+                    meta_var.set("  |  ".join(meta_bits))
+                    status_var.set(err or f"{len(self._plugin_library_entries)} plugins loaded")
+                self.root.after(0, apply)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def filter_entries(*_):
+            term = search_var.get().strip().lower()
+            if not term:
+                update_tree(self._plugin_library_entries)
+                return
+            filtered = []
+            for entry in self._plugin_library_entries:
+                if term in entry.get("id", "").lower() or term in entry.get("name", "").lower():
+                    filtered.append(entry)
+                    continue
+                if any(term in t.lower() for t in entry.get("tags", [])):
+                    filtered.append(entry)
+            update_tree(filtered)
+
+        search_var.trace_add("write", filter_entries)
+
+        def install_selected(enable=False):
+            entry = selected_entry()
+            if not entry:
+                messagebox.showwarning("Plugin Library", "Select a plugin to install.")
+                return
+            if not entry.get("pack_url"):
+                messagebox.showwarning("Plugin Library", "This plugin does not provide a downloadable pack.")
+                return
+            if not self._compatible_with_app(entry):
+                if not messagebox.askyesno(
+                    "Incompatible Plugin",
+                    "This plugin was not marked compatible with your app version. Install anyway?",
+                ):
+                    return
+            status_var.set("Downloading plugin pack...")
+            tmp_dir = tempfile.mkdtemp(prefix="roadgis_pack_dl_")
+            pack_path = os.path.join(tmp_dir, f"{entry.get('id','plugin')}.zip")
+            try:
+                req = urllib.request.Request(entry["pack_url"], headers={"User-Agent": "RoadGISPro"})
+                with urllib.request.urlopen(req, timeout=PLUGIN_LIBRARY_TIMEOUT) as resp:
+                    with open(pack_path, "wb") as f:
+                        f.write(resp.read())
+                installed = self._install_plugin_pack(pack_path)
+                if not installed:
+                    messagebox.showwarning("Plugin Library", "No plugins were installed from this pack.")
+                    status_var.set("Install completed (no changes).")
+                    return
+                self._load_plugins_registry()
+                if enable:
+                    self._enable_plugins_by_id(installed)
+                self._refresh_plugin_manager_list()
+                update_tree(self._plugin_library_entries)
+                messagebox.showinfo(
+                    "Plugin Library",
+                    f"Installed {len(installed)} plugin(s): {', '.join(installed)}",
+                )
+                status_var.set("Install complete.")
+            except Exception as ex:
+                self._log_exception("Failed to install plugin pack", ex, context=entry.get("id"))
+                messagebox.showerror("Plugin Library", f"Install failed: {ex}")
+                status_var.set("Install failed.")
+            finally:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except OSError:
+                    pass
+
+        def open_homepage():
+            entry = selected_entry()
+            if entry and entry.get("homepage"):
+                webbrowser.open(entry.get("homepage"))
+            else:
+                messagebox.showinfo("Plugin Library", "No homepage listed for this plugin.")
+
+        tk.Button(
+            btn_bar, text="Install Pack", command=lambda: install_selected(False),
+            bg=ACCENT, fg="white", relief="flat", bd=0,
+            font=("Consolas", 9, "bold"), padx=12, pady=6, cursor="hand2",
+        ).pack(side="left", padx=4)
+        tk.Button(
+            btn_bar, text="Install + Enable", command=lambda: install_selected(True),
+            bg="#3f8b5f", fg="white", relief="flat", bd=0,
+            font=("Consolas", 9, "bold"), padx=12, pady=6, cursor="hand2",
+        ).pack(side="left", padx=4)
+        tk.Button(
+            btn_bar, text="Open Homepage", command=open_homepage,
+            bg="#4a6aa0", fg="white", relief="flat", bd=0,
+            font=("Consolas", 9, "bold"), padx=12, pady=6, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        apply_details(None)
+        refresh_library()
+
     def _disable_plugin(self, plugin, reason):
         if not plugin.get("enabled", False):
             return
@@ -3676,6 +4190,206 @@ Tools > Open Installation Guide
         else:
             messagebox.showinfo("Validation Result", "File is valid.")
             self._set_status("Validation passed")
+
+    def _bar(self, value, max_value, width=24):
+        if max_value <= 0:
+            return "-" * width
+        fill = int(round(width * (value / max_value)))
+        fill = max(0, min(width, fill))
+        return "#" * fill + "-" * (width - fill)
+
+    def _format_distribution(self, title, counts):
+        lines = [title]
+        if not counts:
+            lines.append("  (none)")
+            return lines
+        max_val = max(counts.values()) if counts else 0
+        for key, val in counts.items():
+            bar = self._bar(val, max_val, width=22)
+            lines.append(f"  {key:<14} | {bar} {val}")
+        return lines
+
+    def _collect_layer_stats(self):
+        payload = self._current_layer_payload()
+        metrics = self._compute_metrics_polyglot(payload)
+        road_count = len(self.roads)
+        connector_count = len(self.connectors)
+        structure_count = len(self.structures)
+        total_len = 0.0
+        total_speed = 0.0
+        total_lanes = 0
+        oneway_count = 0
+        tunnel_count = 0
+        lit_count = 0
+        max_bridge = 0
+        max_weight = 0.0
+        type_counts = {rtype: 0 for rtype in ROAD_TYPES}
+        surface_counts = {s: 0 for s in SURFACE_TYPES}
+        speed_bins = {
+            "0-30": 0,
+            "30-50": 0,
+            "50-70": 0,
+            "70-90": 0,
+            "90-110": 0,
+            "110-140": 0,
+            "140+": 0,
+        }
+        for road in self.roads.values():
+            total_len += road.length()
+            total_speed += float(road.speed or 0.0)
+            total_lanes += int(road.lanes or 0)
+            if as_bool(road.oneway):
+                oneway_count += 1
+            if as_bool(road.tunnel):
+                tunnel_count += 1
+            if as_bool(road.lit):
+                lit_count += 1
+            if isinstance(road.bridge_level, int):
+                max_bridge = max(max_bridge, road.bridge_level)
+            if isinstance(road.max_weight, (int, float)):
+                max_weight = max(max_weight, float(road.max_weight))
+            if road.rtype in type_counts:
+                type_counts[road.rtype] += 1
+            if road.surface in surface_counts:
+                surface_counts[road.surface] += 1
+            speed = float(road.speed or 0.0)
+            if speed < 30:
+                speed_bins["0-30"] += 1
+            elif speed < 50:
+                speed_bins["30-50"] += 1
+            elif speed < 70:
+                speed_bins["50-70"] += 1
+            elif speed < 90:
+                speed_bins["70-90"] += 1
+            elif speed < 110:
+                speed_bins["90-110"] += 1
+            elif speed < 140:
+                speed_bins["110-140"] += 1
+            else:
+                speed_bins["140+"] += 1
+        avg_speed = (total_speed / road_count) if road_count else 0.0
+        avg_lanes = (total_lanes / road_count) if road_count else 0.0
+        return {
+            "metrics": metrics,
+            "road_count": road_count,
+            "connector_count": connector_count,
+            "structure_count": structure_count,
+            "total_length_km": total_len / 1000.0,
+            "avg_speed": avg_speed,
+            "avg_lanes": avg_lanes,
+            "oneway_share": (oneway_count / road_count) if road_count else 0.0,
+            "tunnel_count": tunnel_count,
+            "lit_count": lit_count,
+            "max_bridge_level": max_bridge,
+            "max_weight": max_weight,
+            "type_counts": type_counts,
+            "surface_counts": surface_counts,
+            "speed_bins": speed_bins,
+        }
+
+    def open_layer_insights(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Layer Insights")
+        win.geometry("920x640")
+        win.configure(bg=DARK_BG)
+        win.minsize(760, 520)
+
+        tk.Label(
+            win,
+            text="Layer Insights Dashboard",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        ).pack(fill="x")
+
+        text = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            insertbackground=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 10),
+            padx=12,
+            pady=12,
+        )
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        text.insert("1.0", "Computing metrics and distributions...")
+        text.config(state="disabled")
+
+        btn_bar = tk.Frame(win, bg=DARK_BG)
+        btn_bar.pack(fill="x", padx=12, pady=(0, 12))
+
+        def copy_report():
+            content = text.get("1.0", "end").strip()
+            if not content:
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            self._set_status("Layer insights copied to clipboard")
+
+        tk.Button(
+            btn_bar,
+            text="Copy Report",
+            command=copy_report,
+            bg=ACCENT,
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left")
+
+        def render_report(stats):
+            lines = []
+            metrics = stats.get("metrics") or {}
+            engine = metrics.get("engine") or "python-fallback"
+            lines.append("Core Summary")
+            lines.append(f"- Roads: {stats.get('road_count', 0)}")
+            lines.append(f"- Connectors: {stats.get('connector_count', 0)}")
+            lines.append(f"- Structures: {stats.get('structure_count', 0)}")
+            lines.append(f"- Total Length: {stats.get('total_length_km', 0.0):.2f} km")
+            lines.append(f"- Avg Speed Limit: {stats.get('avg_speed', 0.0):.1f}")
+            lines.append(f"- Avg Lanes: {stats.get('avg_lanes', 0.0):.1f}")
+            lines.append(f"- One-way Share: {stats.get('oneway_share', 0.0) * 100:.1f}%")
+            lines.append(f"- Tunnels: {stats.get('tunnel_count', 0)}")
+            lines.append(f"- Lit Segments: {stats.get('lit_count', 0)}")
+            lines.append(f"- Max Bridge Level: {stats.get('max_bridge_level', 0)}")
+            lines.append(f"- Max Weight: {stats.get('max_weight', 0.0):.1f}")
+            lines.append("")
+            lines.append(f"Metrics Engine: {engine}")
+            lines.append("")
+            lines.extend(self._format_distribution("Road Types", stats.get("type_counts", {})))
+            lines.append("")
+            lines.extend(self._format_distribution("Surface Types", stats.get("surface_counts", {})))
+            lines.append("")
+            lines.extend(self._format_distribution("Speed Buckets", stats.get("speed_bins", {})))
+            content = "\n".join(lines)
+            text.config(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", content)
+            text.config(state="disabled")
+
+        def worker():
+            try:
+                stats = self._collect_layer_stats()
+            except Exception as ex:
+                self._log_exception("Layer insights failed", ex)
+                stats = None
+            def apply():
+                if not stats:
+                    text.config(state="normal")
+                    text.delete("1.0", "end")
+                    text.insert("1.0", "Failed to compute layer insights. See roadgis.log.")
+                    text.config(state="disabled")
+                    return
+                render_report(stats)
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _osm_request_json(self, url, params=None, method="GET", timeout=60):
         headers = {
