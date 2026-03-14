@@ -3099,7 +3099,7 @@ class App:
                 if force:
                     self.root.after(0, lambda: messagebox.showinfo(
                         "Updates",
-                        "You're already on the latest version.",
+                        "Already on the latest version.",
                     ))
                 return
         sig = self._asset_signature(asset)
@@ -3390,7 +3390,7 @@ Tools > Open Installation Guide
 
 1) Recommended first steps
 - Open Tools > Polyglot Setup (OS/Languages)
-- Select language engines you want enabled
+- Select language engines to enable
 - Install built-in plugins via Plugins > Install Built-in Plugins
 - Browse Plugins > Plugin Library for online plugin packs
 - Open Plugins > Plugin Manager and enable desired plugins
@@ -3462,7 +3462,7 @@ Tools > Open Installation Guide
                 "Installer build folder not found.\n"
                 "Expected:\n"
                 f"{packaging_dir}\n\n"
-                "Add the Windows installer scripts to your repo to enable EXE/MSI builds.",
+                "Add the Windows installer scripts to the repo to enable EXE/MSI builds.",
             )
             return
         msg = (
@@ -4033,7 +4033,7 @@ Tools > Open Installation Guide
             if not self._compatible_with_app(entry):
                 if not messagebox.askyesno(
                     "Incompatible Plugin",
-                    "This plugin was not marked compatible with your app version. Install anyway?",
+                    "This plugin is not marked compatible with this app version. Install anyway?",
                 ):
                     return
             status_var.set("Downloading plugin pack...")
@@ -4681,7 +4681,7 @@ Tools > Open Installation Guide
                     roads_n = len(payload.get("roads", []))
                     b_n = len(payload.get("structures", []))
                     self._set_status(f"OSM area loaded: {area} | roads={roads_n} buildings={b_n}")
-                    if messagebox.askyesno("Save Offline Copy", "Do you want to save this OSM area offline now?"):
+                    if messagebox.askyesno("Save Offline Copy", "Save this OSM area offline now?"):
                         suggested = self._suggest_name(area) + FILE_EXT
                         path = filedialog.asksaveasfilename(
                             defaultextension=FILE_EXT,

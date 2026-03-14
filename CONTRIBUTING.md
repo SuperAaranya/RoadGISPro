@@ -7,7 +7,7 @@ Thanks for helping improve RoadGISPro.
 1. Keep contributions relevant to GIS, road mapping, usability, stability, or docs.
 2. Be respectful and constructive in all discussions.
 3. Use clear commit messages that explain what changed and why.
-4. Test your changes before opening a pull request.
+4. Test changes before opening a pull request.
 5. Do not add ads, trackers, or paywall logic.
 6. Keep dependencies reasonable and justified.
 7. Update docs when behavior or workflows change.

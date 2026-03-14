@@ -14,7 +14,7 @@ RoadGISPro is a desktop GIS tool for creating and editing road networks, then ru
   - bridge level
   - max weight
   - surface type
-- Fastest-time routing using your road attributes.
+- Fastest-time routing using road attributes.
 - Undo/redo, copy/paste, zoom fit, layer clearing.
 - Save/load custom `.rgis` format and export/import JSON.
 

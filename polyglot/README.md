@@ -19,7 +19,7 @@ This folder adds optional cross-platform engines:
 ## Build Rust router
 
 ```powershell
-cd "[Insert Path]\YourRoadGISPath\polyglot\rust_router"
+cd "[Insert Path]\RoadGISPath\polyglot\rust_router"
 cargo build --release
 ```
 
@@ -70,7 +70,7 @@ Direct Python:
 python polyglot/setup/setup_languages.py --languages "rust_router,js_metrics,go_metrics,csharp_metrics,rust_validator,go_validator,plugins" --write-config polyglot/runtime_config.json
 ```
 
-You can also start from `polyglot/runtime_config.example.json`.
+A starting point is `polyglot/runtime_config.example.json`.
 
 Tokens available:
 
