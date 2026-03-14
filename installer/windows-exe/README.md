@@ -53,3 +53,5 @@ After build, upload the generated `.exe` to your GitHub Release assets so users 
 
 - This does not generate MSI.
 - MSI can be added separately with WiX Toolset when you are ready.
+
+toodles
