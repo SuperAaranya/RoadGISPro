@@ -52,8 +52,50 @@ try {
         & $python -m pip install pyinstaller
     }
 
-    & $python -m PyInstaller --noconfirm --clean --windowed --onedir --name "RoadGISPro" `
-        --distpath $pyiDist --workpath $pyiBuild --specpath $workRoot $appEntry
+    & $python -c "import tkinter" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Tkinter is not available in this Python. Install Python with Tcl/Tk support and retry."
+    }
+
+    $pyBase = (& $python -c "import sys; print(sys.base_prefix)").Trim()
+    $tclRoot = $null
+    foreach ($cand in @((Join-Path $pyBase "tcl"), (Join-Path (Split-Path $python -Parent) "tcl"))) {
+        if (-not $tclRoot -and (Test-Path $cand)) {
+            $tclRoot = $cand
+        }
+    }
+    $addDataArgs = @()
+    if ($tclRoot) {
+        $tclDir = Get-ChildItem -Directory -Path $tclRoot -Filter "tcl8.*" | Select-Object -First 1
+        $tkDir = Get-ChildItem -Directory -Path $tclRoot -Filter "tk8.*" | Select-Object -First 1
+        if ($tclDir -and $tkDir) {
+            $env:TCL_LIBRARY = $tclDir.FullName
+            $env:TK_LIBRARY = $tkDir.FullName
+            $addDataArgs = @(
+                "--add-data", "$($tclDir.FullName);tcl\$($tclDir.Name)",
+                "--add-data", "$($tkDir.FullName);tcl\$($tkDir.Name)"
+            )
+            Write-Host "Bundling Tcl/Tk from $tclRoot"
+        } else {
+            Write-Host "WARNING: Tcl/Tk directories not found under $tclRoot; tkinter may be missing."
+        }
+    } else {
+        Write-Host "WARNING: Tcl root not found; tkinter may be missing."
+    }
+
+    $pyArgs = @(
+        "-m", "PyInstaller",
+        "--noconfirm",
+        "--clean",
+        "--windowed",
+        "--onedir",
+        "--name", "RoadGISPro",
+        "--distpath", $pyiDist,
+        "--workpath", $pyiBuild,
+        "--specpath", $workRoot
+    ) + $addDataArgs + @($appEntry)
+
+    & $python @pyArgs
 } finally {
     Pop-Location
 }

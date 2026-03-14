@@ -43,6 +43,7 @@ Note: run this from a normal (non-admin) PowerShell window. PyInstaller blocks a
 
 CI/GitHub Actions: if PyInstaller is missing, the script will install it automatically using the Python on PATH.
 If you need a specific Python, pass `-PythonExe "C:\path\to\python.exe"`.
+If you see a tkinter warning or the app fails to launch, reinstall Python with Tcl/Tk support (Modify > Tcl/Tk).
 
 Output:
 
