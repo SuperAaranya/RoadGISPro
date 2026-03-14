@@ -34,7 +34,7 @@ APP_TITLE    = "RoadGIS Pro"
 APP_VERSION  = "1.0.0"
 UPDATE_REPO  = "SuperAaranya/RoadGISPro"
 UPDATE_RELEASE_TAG = "nightly"
-PLUGIN_LIBRARY_URL = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/plugins.json"
+PLUGIN_LIBRARY_URL = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/registry.json"
 PLUGIN_LIBRARY_SITE = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/"
 PLUGIN_LIBRARY_TIMEOUT = 12
 PLUGIN_LIBRARY_CACHE_NAME = "plugin_library_cache.json"
@@ -2854,6 +2854,30 @@ class App:
             "size_bytes": size_bytes,
         }
 
+    def _normalize_library_payload(self, data, url, source_name=None, source_url=None):
+        if isinstance(data, list):
+            plugins = data
+            meta = {"generated_at": None, "source": url}
+        elif isinstance(data, dict):
+            plugins = data.get("plugins") if isinstance(data.get("plugins"), list) else []
+            meta = {
+                "generated_at": data.get("generated_at"),
+                "source": data.get("source") or url,
+            }
+        else:
+            return None, "Library payload was not a JSON object."
+        base_url = url.rsplit("/", 1)[0] + "/"
+        normalized = []
+        for entry in plugins:
+            norm = self._normalize_library_entry(entry, base_url)
+            if norm:
+                if source_name:
+                    norm["source"] = source_name
+                if source_url:
+                    norm["source_url"] = source_url
+                normalized.append(norm)
+        return {"plugins": normalized, "meta": meta}, None
+
     def _compatible_with_app(self, entry):
         min_app = entry.get("min_app_version")
         max_app = entry.get("max_app_version")
@@ -2877,24 +2901,51 @@ class App:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return None, "Library JSON is invalid."
-        if isinstance(data, list):
-            plugins = data
-            meta = {"generated_at": None, "source": url}
-        elif isinstance(data, dict):
-            plugins = data.get("plugins") if isinstance(data.get("plugins"), list) else []
+        if isinstance(data, dict) and isinstance(data.get("sources"), list):
+            base_url = url.rsplit("/", 1)[0] + "/"
+            merged = []
+            seen = set()
+            errors = []
+            for source in data.get("sources", []):
+                if not isinstance(source, dict):
+                    continue
+                src_url = str(source.get("url", "")).strip()
+                if not src_url:
+                    continue
+                src_url = urllib.parse.urljoin(base_url, src_url)
+                src_name = str(source.get("name") or src_url).strip()
+                req2 = urllib.request.Request(src_url, headers={"User-Agent": "RoadGISPro"})
+                try:
+                    with urllib.request.urlopen(req2, timeout=PLUGIN_LIBRARY_TIMEOUT) as resp2:
+                        raw2 = resp2.read().decode("utf-8")
+                    data2 = json.loads(raw2)
+                except Exception as ex:
+                    errors.append(f"{src_name}: {ex}")
+                    continue
+                norm_payload, _ = self._normalize_library_payload(data2, src_url, source_name=src_name, source_url=src_url)
+                if not norm_payload:
+                    continue
+                for entry in norm_payload.get("plugins", []):
+                    pid = entry.get("id")
+                    if not pid or pid in seen:
+                        continue
+                    seen.add(pid)
+                    merged.append(entry)
             meta = {
                 "generated_at": data.get("generated_at"),
-                "source": data.get("source") or url,
+                "source": url,
+                "source_count": len(data.get("sources", [])),
+                "error_count": len(errors),
             }
-        else:
-            return None, "Library payload was not a JSON object."
-        base_url = url.rsplit("/", 1)[0] + "/"
-        normalized = []
-        for entry in plugins:
-            norm = self._normalize_library_entry(entry, base_url)
-            if norm:
-                normalized.append(norm)
-        return {"plugins": normalized, "meta": meta}, None
+            if not merged:
+                msg = "Registry loaded but no plugins were available."
+                if errors:
+                    msg += " Errors: " + "; ".join(errors[:3])
+                return None, msg
+            if errors:
+                meta["errors"] = errors
+            return {"plugins": merged, "meta": meta}, None
+        return self._normalize_library_payload(data, url)
 
     def _is_plugin_installed(self, plugin_id):
         for plugin in self._plugins:
@@ -3874,6 +3925,7 @@ Tools > Open Installation Guide
             lines = [
                 f"Name: {entry.get('name','')}",
                 f"ID: {entry.get('id','')}",
+                f"Source: {entry.get('source','Official')}",
                 f"Language: {entry.get('language','')}",
                 f"Version: {entry.get('version','')}",
                 f"Compatible: {'Yes' if self._compatible_with_app(entry) else 'No'}",
@@ -3945,6 +3997,10 @@ Tools > Open Installation Guide
                         meta_bits.append(f"Updated {meta_info.get('generated_at')}")
                     if meta_info.get("source"):
                         meta_bits.append(f"Source: {meta_info.get('source')}")
+                    if meta_info.get("source_count") is not None:
+                        meta_bits.append(f"Sources: {meta_info.get('source_count')}")
+                    if meta_info.get("error_count"):
+                        meta_bits.append(f"Errors: {meta_info.get('error_count')}")
                     meta_var.set("  |  ".join(meta_bits))
                     status_var.set(err or f"{len(self._plugin_library_entries)} plugins loaded")
                 self.root.after(0, apply)
