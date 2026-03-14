@@ -32,6 +32,7 @@ FILE_KEY     = b"RoadGISPro\x7f\x3a\x91\xb4\x2d\xe0\x55\xc8"
 APP_TITLE    = "RoadGIS Pro"
 APP_VERSION  = "1.0.0"
 UPDATE_REPO  = "SuperAaranya/RoadGISPro"
+UPDATE_RELEASE_TAG = "nightly"
 
 
 def _resolve_base_dir():
@@ -2751,6 +2752,7 @@ class App:
             "first_launch_shown_at": None,
             "last_update_check": None,
             "last_update_prompted": None,
+            "last_update_asset_sig": None,
         }
         if os.path.exists(APP_STATE_PATH):
             try:
@@ -2792,7 +2794,10 @@ class App:
         threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
 
     def _fetch_latest_release(self):
-        url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+        if UPDATE_RELEASE_TAG:
+            url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/tags/{UPDATE_RELEASE_TAG}"
+        else:
+            url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
         req = urllib.request.Request(url, headers={"User-Agent": "RoadGISPro"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8")
@@ -2819,6 +2824,7 @@ class App:
             "name": str(data.get("name") or tag),
             "body": str(body),
             "asset": chosen,
+            "release_url": str(data.get("html_url") or ""),
         }
 
     def _check_for_updates_worker(self):
@@ -2829,13 +2835,31 @@ class App:
             return
         if not latest:
             return
-        current_v = self._parse_version(APP_VERSION)
-        latest_v = self._parse_version(latest.get("tag") or latest.get("name"))
-        if latest_v <= current_v:
+        asset = latest.get("asset")
+        if not isinstance(asset, dict):
+            return
+        if not UPDATE_RELEASE_TAG or UPDATE_RELEASE_TAG.lower() != "nightly":
+            current_v = self._parse_version(APP_VERSION)
+            latest_v = self._parse_version(latest.get("tag") or latest.get("name"))
+            if latest_v <= current_v:
+                return
+        sig = self._asset_signature(asset)
+        state = self._load_app_state()
+        if state.get("last_update_asset_sig") == sig:
             return
         self.root.after(0, lambda: self._show_update_dialog(latest))
 
+    def _asset_signature(self, asset):
+        return f"{asset.get('id')}:{asset.get('size')}:{asset.get('updated_at')}"
+
     def _show_update_dialog(self, latest):
+        asset = latest.get("asset") or {}
+        sig = self._asset_signature(asset)
+        state = self._load_app_state()
+        state["last_update_asset_sig"] = sig
+        state["last_update_prompted"] = datetime.now().isoformat(timespec="seconds")
+        self._save_app_state(state)
+
         win = tk.Toplevel(self.root)
         win.title("Update Available")
         win.geometry("720x520")
@@ -2843,9 +2867,10 @@ class App:
         win.minsize(620, 420)
         win.grab_set()
 
+        channel = "Nightly" if UPDATE_RELEASE_TAG and UPDATE_RELEASE_TAG.lower() == "nightly" else "Release"
         title = tk.Label(
             win,
-            text=f"New version available: {latest.get('name', '')}",
+            text=f"{channel} update available: {latest.get('name', '')}",
             bg=DARK_BG,
             fg=ACCENT,
             font=("Consolas", 13, "bold"),
