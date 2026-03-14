@@ -2791,7 +2791,7 @@ class App:
                 pass
         state["last_update_check"] = datetime.now().isoformat(timespec="seconds")
         self._save_app_state(state)
-        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+        threading.Thread(target=self._check_for_updates_worker, args=(force,), daemon=True).start()
 
     def _fetch_latest_release(self):
         if UPDATE_RELEASE_TAG:
@@ -2799,11 +2799,19 @@ class App:
         else:
             url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
         req = urllib.request.Request(url, headers={"User-Agent": "RoadGISPro"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8")
-        data = json.loads(raw)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read().decode("utf-8")
+        except Exception as ex:
+            return {"error": f"Update check failed: {ex}"}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"error": "Update check returned invalid JSON."}
         if not isinstance(data, dict):
-            return None
+            return {"error": "Update check returned unexpected data."}
+        if data.get("message") and not data.get("tag_name"):
+            return {"error": str(data.get("message"))}
         tag = data.get("tag_name") or data.get("name") or ""
         body = data.get("body") or ""
         assets = data.get("assets") if isinstance(data.get("assets"), list) else []
@@ -2827,25 +2835,41 @@ class App:
             "release_url": str(data.get("html_url") or ""),
         }
 
-    def _check_for_updates_worker(self):
-        try:
-            latest = self._fetch_latest_release()
-        except Exception as ex:
-            self._log_exception("Update check failed", ex, context="github")
-            return
-        if not latest:
+    def _check_for_updates_worker(self, force=False):
+        latest = self._fetch_latest_release()
+        if not latest or latest.get("error"):
+            if latest and latest.get("error"):
+                self._log("WARN", latest.get("error"), context="update")
+            if force:
+                msg = latest.get("error") if latest else "No update info available."
+                self.root.after(0, lambda: messagebox.showinfo("Updates", msg))
             return
         asset = latest.get("asset")
         if not isinstance(asset, dict):
+            if force:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Updates",
+                    "No installer asset (.exe) was found in the release.",
+                ))
             return
         if not UPDATE_RELEASE_TAG or UPDATE_RELEASE_TAG.lower() != "nightly":
             current_v = self._parse_version(APP_VERSION)
             latest_v = self._parse_version(latest.get("tag") or latest.get("name"))
             if latest_v <= current_v:
+                if force:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Updates",
+                        "You're already on the latest version.",
+                    ))
                 return
         sig = self._asset_signature(asset)
         state = self._load_app_state()
         if state.get("last_update_asset_sig") == sig:
+            if force:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Updates",
+                    "No new installer build found yet.",
+                ))
             return
         self.root.after(0, lambda: self._show_update_dialog(latest))
 
