@@ -1,30 +1,41 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, simpledialog
+import base64
+import copy
+import hashlib
+import heapq
 import json
-import uuid
 import math
 import os
-import sys
-import base64
-import hashlib
-import struct
-import zlib
-import copy
-import heapq
-import time
-import shutil
-import subprocess
-import traceback
 import platform
-from datetime import datetime
+import re
+import shutil
+import struct
+import subprocess
+import sys
 import tempfile
+import threading
+import time
+import tkinter as tk
+import traceback
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
-import re
-import threading
-from queue import Queue, Empty
 import zipfile
+import zlib
+from datetime import datetime
+from queue import Empty, Queue
+from tkinter import filedialog, messagebox, ttk
+
+from roadgis_support import osm_cache
+from roadgis_support.audit import run_project_audit
+from roadgis_support.platforms import (
+    detect_current_profile,
+    installer_paths,
+    profile_by_label,
+    profile_choices,
+    recommended_language_tokens,
+)
+from roadgis_support.ursina_bridge import launch_ursina_view, ursina_available
 
 FILE_MAGIC   = b"RGIS"
 FILE_VERSION = 1
@@ -108,7 +119,7 @@ def encode_rgis(data) -> bytes:
     payload      = json.dumps(data, separators=(",", ":")).encode("utf-8")
     compressed   = zlib.compress(payload, level=9)
     keystream    = _derive_keystream(len(compressed))
-    encrypted    = bytes(b ^ k for b, k in zip(compressed, keystream))
+    encrypted    = bytes(b ^ k for b, k in zip(compressed, keystream, strict=True))
     checksum     = zlib.crc32(compressed) & 0xFFFFFFFF
     header       = FILE_MAGIC + struct.pack(">BII", FILE_VERSION, len(encrypted), checksum)
     encoded      = base64.b85encode(header + encrypted)
@@ -132,7 +143,7 @@ def decode_rgis(raw: bytes):
     if len(encrypted) != payload_len:
         raise ValueError("Payload length mismatch - file may be truncated or corrupt.")
     keystream = _derive_keystream(len(encrypted))
-    compressed = bytes(b ^ k for b, k in zip(encrypted, keystream))
+    compressed = bytes(b ^ k for b, k in zip(encrypted, keystream, strict=True))
     if (zlib.crc32(compressed) & 0xFFFFFFFF) != checksum:
         raise ValueError("Checksum mismatch - file is corrupt or has been tampered with.")
     try:
@@ -207,6 +218,56 @@ SELECT_COL  = "#00e5ff"
 HOVER_COL   = "#ffdd55"
 GRID_COL    = "#1e2840"
 GRID_LABEL  = "#2a3a60"
+
+ROAD_TEXTURE_MODES = {
+    "surface": "By Surface",
+    "asphalt": "Asphalt",
+    "gravel": "Gravel",
+    "dirt": "Dirt",
+}
+
+DISPLAY_MODES = {
+    "chart": "Blue Chart",
+    "color": "Color",
+}
+
+TERRAIN_SWATCHES = {
+    "meadow": ((56, 116, 66), (102, 166, 92)),
+    "field": ((124, 154, 72), (170, 190, 104)),
+    "dry": ((145, 126, 76), (188, 160, 102)),
+    "rock": ((101, 108, 118), (144, 152, 160)),
+}
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _hex_to_rgb(value):
+    value = value.lstrip("#")
+    if len(value) != 6:
+        return (128, 128, 128)
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb):
+    return "#" + "".join(f"{clamp(int(round(c)), 0, 255):02x}" for c in rgb)
+
+
+def _mix_rgb(a, b, t):
+    t = clamp(float(t), 0.0, 1.0)
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def _color_scale(rgb, factor):
+    return tuple(clamp(channel * factor, 0, 255) for channel in rgb)
+
+
+def _grid_noise(ix, iy, seed=0):
+    n = int(ix) * 374761393 + int(iy) * 668265263 + int(seed) * 69069
+    n = (n ^ (n >> 13)) * 1274126177
+    n ^= n >> 16
+    return (n & 0xFFFFFFFF) / 0xFFFFFFFF
 
 
 def catmull_rom_point(p0, p1, p2, p3, t):
@@ -429,8 +490,12 @@ class App:
         self._pan_origin    = None
         self._show_grid     = True
         self._show_nodes    = True
-        self._show_names    = True
+        self._show_names    = False
         self._show_casing   = True
+        self._display_mode = "color"
+        self._road_texture_mode = "surface"
+        self._show_3d_trees = True
+        self._show_3d_streetlights = True
         self._tooltip_win   = None
         self._pending_tip   = None
         self._redraw_queued = False
@@ -446,8 +511,10 @@ class App:
         self._drive_pos     = None
         self._drive_heading = 0.0
         self._drive_speed   = 0.0
+        self._drive_zoom    = 1.0
         self._drive_lane_offset = 0.0
         self._drive_elev = 0.0
+        self._drive_mouse_anchor = None
         self._drive_fps_smooth = 0.0
         self._drive_seg_index = None
         self._drive_struct_index = None
@@ -461,7 +528,9 @@ class App:
         self._plugin_manager_win = None
         self._plugin_library_win = None
         self._plugin_library_entries = []
+        self._platform_profile = detect_current_profile()
         self._runtime_cfg = self._load_runtime_config()
+        self._apply_view_preferences()
 
         root.title(APP_TITLE)
         root.configure(bg=DARK_BG)
@@ -506,6 +575,7 @@ class App:
             ("Save As          Ctrl+Shift+S", self.save_as),
             None,
             ("OSM Mode (Download Offline)",   self.open_osm_download_dialog),
+            ("Open Cached OSM Library",       self.open_cached_osm_library),
             None,
             ("Export JSON",                   self.export_json),
             None,
@@ -517,13 +587,33 @@ class App:
             ("Zoom Out     -",    self.zoom_out),
             ("Zoom Fit     F",    self.zoom_fit),
             ("Reset View   Home", self.reset_view),
-            ("Drive 3D      T",   self.open_drive_mode),
+            ("Open 3D View  T",   self.open_drive_mode),
             None,
             ("Toggle Grid   G",   self.toggle_grid),
             ("Toggle Nodes  N",   self.toggle_nodes),
             ("Toggle Labels L",   self.toggle_names),
             ("Toggle Casing C",   self.toggle_casing),
+            ("Toggle 3D Trees",   self.toggle_3d_trees),
+            ("Toggle 3D Lights",  self.toggle_3d_streetlights),
         ])
+
+        style_menu = tk.Menu(mb, tearoff=0, bg=PANEL_BG, fg=PANEL_FG,
+                             activebackground=ACCENT, activeforeground="white")
+        mb.add_cascade(label="Style", menu=style_menu)
+        for key, label in DISPLAY_MODES.items():
+            style_menu.add_command(
+                label=f"Display: {label}",
+                command=lambda m=key: self.set_display_mode(m),
+            )
+        style_menu.add_separator()
+        for key, label in ROAD_TEXTURE_MODES.items():
+            style_menu.add_command(
+                label=f"Color Road Texture: {label}",
+                command=lambda m=key: self.set_road_texture_mode(m),
+            )
+        style_menu.add_separator()
+        style_menu.add_command(label="3D Trees", command=self.toggle_3d_trees)
+        style_menu.add_command(label="3D Streetlights", command=self.toggle_3d_streetlights)
 
         menu("Edit", [
             ("Undo             Ctrl+Z",   self.undo),
@@ -541,8 +631,10 @@ class App:
             ("Validate Layer File", self.validate_layer_file_dialog),
             ("Layer Insights Dashboard", self.open_layer_insights),
             ("Run Plugins on Current Layer", self.run_plugins_on_current_layer),
+            ("Run Code Audit", self.open_code_audit_report),
             ("Polyglot Setup (OS/Languages)", self.open_polyglot_setup),
             ("Open Installation Guide", self.open_installation_guide),
+            ("Open Onboarding Tutorial", self.open_onboarding_tutorial),
             ("Report Issue (Create Zip)", self.report_issue_bundle),
             ("Check for Updates", lambda: self._maybe_check_for_updates(force=True)),
             ("Build Installers", self.open_installer_builder_info),
@@ -553,6 +645,12 @@ class App:
             ("Plugin Manager", self.open_plugin_manager),
             ("Reload Plugin Registry", self._reload_plugins_registry),
             ("Install Built-in Plugins", self.install_builtin_plugins),
+        ])
+
+        menu("Help", [
+            ("Onboarding Tutorial", self.open_onboarding_tutorial),
+            ("Installation Guide", self.open_installation_guide),
+            ("Run Code Audit", self.open_code_audit_report),
         ])
 
     def _build_toolbar(self):
@@ -567,8 +665,15 @@ class App:
         tk.Frame(tb, bg=BORDER, width=1).pack(side="left", fill="y", pady=8)
 
         self._mode_buttons = {}
+        self._display_mode_buttons = {}
 
-        for text, mode, key in [("Draw", "draw", "D"), ("Select", "select", "S"), ("Pan", "pan", "P"), ("Route", "route", "R"), ("Connect", "connect", "K")]:
+        for text, mode, key in [
+            ("Draw", "draw", "D"),
+            ("Select", "select", "S"),
+            ("Pan", "pan", "P"),
+            ("Route", "route", "R"),
+            ("Connect", "connect", "K"),
+        ]:
             b = tk.Button(
                 tb, text=f"{text} [{key}]",
                 command=lambda m=mode: self.set_mode(m),
@@ -582,9 +687,23 @@ class App:
 
         tk.Frame(tb, bg=BORDER, width=1).pack(side="left", fill="y", pady=8)
 
+        for text, mode in [("Chart", "chart"), ("Color", "color")]:
+            b = tk.Button(
+                tb, text=text,
+                command=lambda m=mode: self.set_display_mode(m),
+                bg=PANEL_BG, fg=PANEL_FG, relief="flat",
+                font=("Consolas", 9, "bold"),
+                activebackground=ACCENT, activeforeground="white",
+                padx=10, pady=5, cursor="hand2", bd=0,
+            )
+            b.pack(side="left", padx=2, pady=6)
+            self._display_mode_buttons[mode] = b
+
+        tk.Frame(tb, bg=BORDER, width=1).pack(side="left", fill="y", pady=8)
+
         for text, cmd, fg in [
             ("Fit [F]", self.zoom_fit, PANEL_FG),
-            ("Drive 3D [T]", self.open_drive_mode, "#ff8e8e"),
+            ("3D View [T]", self.open_drive_mode, "#ff8e8e"),
             ("Clear Route", self._clear_route_and_redraw, PANEL_FG),
             ("Delete [Del]", self.delete_selected, ACCENT2),
         ]:
@@ -607,6 +726,7 @@ class App:
                  font=("Consolas", 8)).pack(side="right", padx=12)
 
         self._update_mode_buttons()
+        self._update_display_mode_buttons()
 
     def _build_main(self):
         main = tk.Frame(self.root, bg=DARK_BG)
@@ -829,7 +949,7 @@ class App:
 
         leg = tk.Frame(body, bg=PANEL_BG)
         leg.pack(fill="x", padx=PAD, pady=6)
-        for rtype, style in ROAD_STYLES.items():
+        for _rtype, style in ROAD_STYLES.items():
             row = tk.Frame(leg, bg=PANEL_BG)
             row.pack(fill="x", pady=2)
             sw = tk.Canvas(row, bg=PANEL_BG, width=36, height=12,
@@ -863,7 +983,7 @@ class App:
             ("Esc",         "Cancel draw"),
             ("R",           "Route mode"),
             ("K",           "Connector mode"),
-            ("T",           "Open 3D drive mode"),
+            ("T",           "Open 3D planning view"),
             ("Del",         "Delete selected"),
         ]
         for key, desc in controls:
@@ -996,13 +1116,21 @@ class App:
             self._clear_route()
         if mode != "connect":
             self._pending_connector = None
-        cursors = {"draw": "crosshair", "select": "arrow", "pan": "fleur", "route": "tcross", "connect": "crosshair"}
+        cursors = {
+            "draw": "crosshair",
+            "select": "arrow",
+            "pan": "fleur",
+            "route": "tcross",
+            "connect": "crosshair",
+        }
         self.canvas.config(cursor=cursors.get(mode, "arrow"))
         self._update_mode_buttons()
         if mode == "route":
             self._set_status("Route mode active  |  Click start and destination")
         elif mode == "connect":
-            self._set_status("Connect mode active  |  Click two vertices to build a connector/interchange")
+            self._set_status(
+                "Connect mode active  |  Click two vertices to build a connector/interchange"
+            )
         else:
             self._set_status(f"{mode.capitalize()} mode active")
         self.redraw()
@@ -1027,6 +1155,22 @@ class App:
                 fg="white" if active else PANEL_FG,
             )
 
+    def _update_display_mode_buttons(self):
+        for mode, btn in self._display_mode_buttons.items():
+            active = mode == self._display_mode
+            btn.config(
+                bg=ACCENT if active else PANEL_BG,
+                fg="white" if active else PANEL_FG,
+            )
+
+    def _normalize_display_mode(self, mode):
+        mode = str(mode).strip().lower()
+        return mode if mode in DISPLAY_MODES else "color"
+
+    def _normalize_road_texture_mode(self, mode):
+        mode = str(mode).strip().lower()
+        return mode if mode in ROAD_TEXTURE_MODES else "surface"
+
     def world(self, x, y):
         return ((x - self.offx) / self.scale, (y - self.offy) / self.scale)
 
@@ -1043,6 +1187,18 @@ class App:
                     best_d = d
                     best   = pt
         return best if best else p
+
+    def _append_draw_point(self, p, min_dist_px=12):
+        snapped = list(self.snap(p))
+        if self.current:
+            last = self.current[-1]
+            min_world = max(1.0, min_dist_px / max(self.scale, 0.001))
+            if math.hypot(snapped[0] - last[0], snapped[1] - last[1]) < min_world:
+                return False
+        self.current.append(snapped)
+        self.dirty = True
+        self._set_status(f"Drawing  {len(self.current)} vertices  |  Right-click to commit")
+        return True
 
     def on_click(self, e):
         if self.mode == "pan":
@@ -1068,13 +1224,8 @@ class App:
                 self._info_var.set("No feature selected")
             self.redraw()
             return
-        p = self.snap((wx, wy))
-        self.current.append(list(p))
-        self.dirty = True
-        self._set_status(
-            f"Drawing  {len(self.current)} vertices  |  Right-click to commit"
-        )
-        self.redraw()
+        if self._append_draw_point((wx, wy), min_dist_px=10):
+            self.redraw()
 
     def _hit_test(self, wx, wy):
         threshold = SNAP_PX / self.scale
@@ -1179,6 +1330,11 @@ class App:
     def on_drag(self, e):
         if self.mode == "pan":
             self.pan_move(e)
+            return
+        if self.mode == "draw":
+            wx, wy = self.world(e.x, e.y)
+            if self._append_draw_point((wx, wy), min_dist_px=18):
+                self.request_redraw()
             return
         if self.mode == "select" and self.drag_info:
             road, idx = self.drag_info
@@ -1288,11 +1444,47 @@ class App:
 
     def toggle_names(self):
         self._show_names = not self._show_names
+        self._save_view_preferences()
         self.redraw()
 
     def toggle_casing(self):
         self._show_casing = not self._show_casing
         self.redraw()
+
+    def set_display_mode(self, mode):
+        self._display_mode = self._normalize_display_mode(mode)
+        self._save_view_preferences()
+        self._update_display_mode_buttons()
+        extra = ""
+        if self._display_mode == "color":
+            extra = f"  |  Texture {ROAD_TEXTURE_MODES[self._road_texture_mode]}"
+        self._set_status(f"Display mode: {DISPLAY_MODES[self._display_mode]}{extra}")
+        self.redraw()
+
+    def toggle_3d_trees(self):
+        self._show_3d_trees = not self._show_3d_trees
+        state = "on" if self._show_3d_trees else "off"
+        self._set_status(f"3D trees {state}")
+
+    def toggle_3d_streetlights(self):
+        self._show_3d_streetlights = not self._show_3d_streetlights
+        state = "on" if self._show_3d_streetlights else "off"
+        self._set_status(f"3D streetlights {state}")
+
+    def set_road_texture_mode(self, mode):
+        self._road_texture_mode = self._normalize_road_texture_mode(mode)
+        self._save_view_preferences()
+        extra = ""
+        if self._display_mode != "color":
+            extra = "  |  Switch to Color mode to preview"
+        texture_label = ROAD_TEXTURE_MODES[self._road_texture_mode]
+        self._set_status(f"Color road textures: {texture_label}{extra}")
+        self.redraw()
+
+    def _effective_surface_texture(self, surface):
+        if self._road_texture_mode == "surface":
+            return surface if surface in SURFACE_TYPES else "asphalt"
+        return self._road_texture_mode
 
     def cancel_draw(self):
         self.current = []
@@ -1383,13 +1575,113 @@ class App:
         self._redraw_queued = False
         self.redraw()
 
+    def _terrain_color_at(self, wx, wy):
+        ix = int(math.floor(wx / 180.0))
+        iy = int(math.floor(wy / 180.0))
+        broad = _grid_noise(ix // 2, iy // 2, seed=11)
+        detail = _grid_noise(ix, iy, seed=29)
+        blend = broad * 0.7 + detail * 0.3
+        if blend < 0.18:
+            swatch = TERRAIN_SWATCHES["rock"]
+        elif blend < 0.36:
+            swatch = TERRAIN_SWATCHES["dry"]
+        elif blend < 0.72:
+            swatch = TERRAIN_SWATCHES["meadow"]
+        else:
+            swatch = TERRAIN_SWATCHES["field"]
+        shade = _grid_noise(ix + 17, iy - 9, seed=43)
+        rgb = _mix_rgb(swatch[0], swatch[1], shade)
+        return _rgb_to_hex(rgb)
+
+    def _draw_terrain(self, w, h):
+        tile_px = clamp(56 / max(self.scale ** 0.18, 0.65), 36, 84)
+        step_world = max(45.0, tile_px / max(self.scale, 0.001))
+        minx, miny = self.world(0, 0)
+        maxx, maxy = self.world(w, h)
+        start_x = math.floor(minx / step_world) * step_world
+        start_y = math.floor(miny / step_world) * step_world
+        end_x = math.ceil(maxx / step_world) * step_world
+        end_y = math.ceil(maxy / step_world) * step_world
+        wx = start_x
+        while wx < end_x:
+            wy = start_y
+            while wy < end_y:
+                sx1, sy1 = self.screen(wx, wy)
+                sx2, sy2 = self.screen(wx + step_world, wy + step_world)
+                self.canvas.create_rectangle(
+                    sx1, sy1, sx2, sy2,
+                    fill=self._terrain_color_at(wx, wy),
+                    outline="",
+                )
+                wy += step_world
+            wx += step_world
+
+    def _draw_map_background(self, w, h):
+        self.canvas.create_rectangle(0, 0, w, h, fill=MAP_BG, outline="")
+        if self._display_mode == "color":
+            self._draw_terrain(w, h)
+
+    def _draw_chart_surface_hint(self, road, flat, width):
+        if road.surface in ("gravel", "dirt"):
+            self.canvas.create_line(
+                *flat,
+                width=max(1, width * 0.4),
+                fill="#cfd6e6",
+                capstyle="round",
+                joinstyle="round",
+                dash=(2, int(max(4, width * 2))),
+            )
+
+    def _draw_road_surface_texture(self, road, flat, width):
+        surface = self._effective_surface_texture(road.surface)
+        if surface in ("asphalt", "paved", "concrete"):
+            shoulder = "#f3efe0" if surface == "concrete" else "#d8c78f"
+            center = "#fff8d8" if road.oneway else "#f5f0c7"
+            edge_width = max(1, width * 0.14)
+            self.canvas.create_line(*flat, width=edge_width, fill=shoulder,
+                                    capstyle="round", joinstyle="round")
+            if width >= 2.2:
+                dash = None if road.oneway else (10, 8)
+                kwargs = {"capstyle": "round", "joinstyle": "round"}
+                if dash:
+                    kwargs["dash"] = dash
+                self.canvas.create_line(*flat, width=max(1, width * 0.22), fill=center, **kwargs)
+        elif surface == "gravel":
+            self.canvas.create_line(*flat, width=max(1, width * 0.42), fill="#d8d2bf",
+                                    capstyle="round", joinstyle="round", dash=(2, 6))
+            self.canvas.create_line(*flat, width=max(1, width * 0.18), fill="#8d8572",
+                                    capstyle="round", joinstyle="round", dash=(1, 10))
+        elif surface == "dirt":
+            self.canvas.create_line(*flat, width=max(1, width * 0.36), fill="#b58b59",
+                                    capstyle="round", joinstyle="round", dash=(7, 8))
+            self.canvas.create_line(*flat, width=max(1, width * 0.12), fill="#80552d",
+                                    capstyle="round", joinstyle="round", dash=(1, 11))
+
+    def _road_fill_color(self, road):
+        surface = self._effective_surface_texture(road.surface)
+        if surface == "concrete":
+            return "#8d918f"
+        if surface in ("gravel", "cobblestone"):
+            return "#8f816b"
+        if surface == "dirt":
+            return "#895b37"
+        if surface == "paved":
+            return "#42464b"
+        return "#35383d"
+
+    def _draw_road_detail_layer(self, road, flat, width):
+        if self._display_mode == "chart":
+            self._draw_chart_surface_hint(road, flat, width)
+            return
+        self._draw_road_surface_texture(road, flat, width)
+
     def redraw(self):
         c = self.canvas
         c.delete("all")
 
         w = c.winfo_width()  or 1200
         h = c.winfo_height() or 800
-        c.create_rectangle(0, 0, w, h, fill=MAP_BG, outline="")
+        self._draw_map_background(w, h)
 
         if self._show_grid:
             self._draw_grid()
@@ -1408,7 +1700,11 @@ class App:
                 sx, sy = self.screen(float(p[0]), float(p[1]))
                 flat.extend([sx, sy])
             if len(flat) >= 6:
-                c.create_polygon(*flat, fill="#2f3f5a", outline="#51688d", width=1)
+                height = float(self._parse_num(st.get("height"), 18.0))
+                t = clamp(height / 80.0, 0.0, 1.0)
+                fill = _rgb_to_hex(_mix_rgb((63, 84, 78), (126, 144, 152), t))
+                outline = _rgb_to_hex(_color_scale(_hex_to_rgb(fill), 0.72))
+                c.create_polygon(*flat, fill=fill, outline=outline, width=1)
 
         road_order = sorted(
             self.roads.values(),
@@ -1462,10 +1758,7 @@ class App:
             c.create_line(*flat, width=width, fill=color,
                           capstyle="round", joinstyle="round", **dash_args)
 
-            if r.surface in ("gravel", "dirt"):
-                c.create_line(*flat, width=max(1, width * 0.4), fill="#cfd6e6",
-                              capstyle="round", joinstyle="round",
-                              dash=(2, int(max(4, width * 2))))
+            self._draw_road_detail_layer(r, flat, width)
 
             if r.oneway:
                 self._draw_oneway_arrows(c, draw_pts, width)
@@ -2194,7 +2487,7 @@ class App:
     def _drive_key_press(self, e):
         mapping = {"Up": "w", "Down": "s", "Left": "a", "Right": "d"}
         key = mapping.get(e.keysym, e.keysym.lower())
-        if key in {"w", "a", "s", "d"}:
+        if key in {"w", "a", "s", "d", "q", "e", "shift_l", "shift_r"}:
             self._drive_keys.add(key)
 
     def _drive_key_release(self, e):
@@ -2203,10 +2496,47 @@ class App:
         if key in self._drive_keys:
             self._drive_keys.remove(key)
 
+    def _drive_mouse_wheel(self, e):
+        if hasattr(e, "delta") and e.delta:
+            factor = 1.1 if e.delta > 0 else 1 / 1.1
+        elif getattr(e, "num", None) == 4:
+            factor = 1.1
+        else:
+            factor = 1 / 1.1
+        self._drive_zoom = clamp(self._drive_zoom * factor, 0.55, 2.6)
+
+    def _drive_mouse_down(self, e):
+        self._drive_mouse_anchor = (e.x, e.y, self._drive_heading)
+
+    def _drive_mouse_drag(self, e):
+        if not self._drive_mouse_anchor:
+            return
+        ax, ay, heading = self._drive_mouse_anchor
+        self._drive_heading = heading + (e.x - ax) * 0.008
+
+    def _drive_mouse_up(self, _e):
+        self._drive_mouse_anchor = None
+
+    def _build_ursina_scene_payload(self):
+        return {
+            "roads": [r.to_dict() for r in self.roads.values()],
+            "structures": self.structures,
+            "route_path": self.route_path,
+            "texture_mode": self._road_texture_mode,
+            "show_trees": self._show_3d_trees,
+            "show_streetlights": self._show_3d_streetlights,
+        }
+
     def open_drive_mode(self):
         if not self.roads:
-            self._set_status("Drive mode unavailable: draw at least one road first")
+            self._set_status("3D view unavailable: draw at least one road first")
             return
+        if self._runtime_cfg.get("prefer_ursina_3d", True):
+            ok, msg = launch_ursina_view(self._build_ursina_scene_payload(), APP_LOG_PATH)
+            if ok:
+                self._set_status(msg)
+                return
+            self._log("WARN", msg, context="ursina")
         self._drive_index_dirty = True
         self._ensure_drive_index()
         if self._drive_win and self._drive_win.winfo_exists():
@@ -2216,28 +2546,33 @@ class App:
             return
         spawn = self._pick_drive_spawn()
         if not spawn:
-            self._set_status("Drive mode unavailable: no drivable segment found")
+            self._set_status("3D view unavailable: no road segment found")
             return
         self._drive_pos = (spawn[0], spawn[1])
         self._drive_heading = spawn[2]
         self._drive_speed = 0.0
+        self._drive_zoom = 1.0
         self._drive_lane_offset = 0.0
         self._drive_elev = 0.0
         self._drive_keys = set()
+        self._drive_mouse_anchor = None
 
         win = tk.Toplevel(self.root)
-        win.title(f"{APP_TITLE} - 3D Drive")
+        win.title(f"{APP_TITLE} - 3D View")
         win.geometry("980x620")
         win.configure(bg="#0a0d15")
         win.minsize(700, 440)
         win.bind("<KeyPress>", self._drive_key_press)
         win.bind("<KeyRelease>", self._drive_key_release)
         win.bind("<Escape>", lambda _e: self.close_drive_mode())
+        win.bind("<MouseWheel>", self._drive_mouse_wheel)
+        win.bind("<Button-4>", self._drive_mouse_wheel)
+        win.bind("<Button-5>", self._drive_mouse_wheel)
         win.protocol("WM_DELETE_WINDOW", self.close_drive_mode)
 
         hud = tk.Label(
             win,
-            text="WASD / Arrow Keys: Drive   |   Esc: Exit",
+            text="WASD / Arrows: Pan   |   Q/E or Drag: Orbit   |   Wheel: Zoom   |   Esc: Exit",
             bg="#0a0d15",
             fg="#98a8c8",
             font=("Consolas", 10, "bold"),
@@ -2247,10 +2582,13 @@ class App:
 
         self._drive_canvas = tk.Canvas(win, bg="#070a12", highlightthickness=0, bd=0)
         self._drive_canvas.pack(side="top", fill="both", expand=True)
+        self._drive_canvas.bind("<ButtonPress-1>", self._drive_mouse_down)
+        self._drive_canvas.bind("<B1-Motion>", self._drive_mouse_drag)
+        self._drive_canvas.bind("<ButtonRelease-1>", self._drive_mouse_up)
 
         self._drive_win = win
         self._drive_last_tick = time.perf_counter()
-        self._set_status("3D drive mode active")
+        self._set_status("3D planning view active")
         win.focus_force()
         self._drive_tick()
 
@@ -2265,6 +2603,7 @@ class App:
         self._drive_keys = set()
         self._drive_lane_offset = 0.0
         self._drive_elev = 0.0
+        self._drive_mouse_anchor = None
         if self._drive_win and self._drive_win.winfo_exists():
             try:
                 self._drive_win.destroy()
@@ -2272,7 +2611,7 @@ class App:
                 pass
         self._drive_win = None
         self._drive_canvas = None
-        self._set_status("3D drive mode closed")
+        self._set_status("3D view closed")
 
     def _drive_tick(self):
         if not (self._drive_win and self._drive_win.winfo_exists() and self._drive_canvas):
@@ -2290,51 +2629,26 @@ class App:
         else:
             self._drive_fps_smooth = self._drive_fps_smooth * 0.9 + inst_fps * 0.1
 
-        throttle = (1 if "w" in self._drive_keys else 0) - (1 if "s" in self._drive_keys else 0)
-        steer = (1 if "d" in self._drive_keys else 0) - (1 if "a" in self._drive_keys else 0)
-
-        if throttle > 0:
-            self._drive_speed += DRIVE_ACCEL * dt
-        elif throttle < 0:
-            self._drive_speed -= DRIVE_BRAKE * dt
-        else:
-            self._drive_speed *= max(0.0, 1.0 - 1.3 * dt)
-
-        self._drive_speed = max(-DRIVE_REVERSE_SPEED, min(DRIVE_MAX_SPEED, self._drive_speed))
-        turn_gain = max(0.18, min(1.0, abs(self._drive_speed) / DRIVE_MAX_SPEED))
-        self._drive_heading += steer * DRIVE_TURN_RATE * dt * turn_gain * (1 if self._drive_speed >= 0 else -1)
-
         x, y = self._drive_pos
-        nx = x + math.cos(self._drive_heading) * self._drive_speed * dt
-        ny = y + math.sin(self._drive_heading) * self._drive_speed * dt
+        fast = 2.1 if ("shift_l" in self._drive_keys or "shift_r" in self._drive_keys) else 1.0
+        pan_speed = 180.0 * fast / max(self._drive_zoom, 0.75)
+        orbit = (1 if "e" in self._drive_keys else 0) - (1 if "q" in self._drive_keys else 0)
+        forward = (1 if "w" in self._drive_keys else 0) - (1 if "s" in self._drive_keys else 0)
+        strafe = (1 if "d" in self._drive_keys else 0) - (1 if "a" in self._drive_keys else 0)
+        self._drive_heading += orbit * dt * 1.7
+        cos_h = math.cos(self._drive_heading)
+        sin_h = math.sin(self._drive_heading)
+        nx = x + (cos_h * forward - sin_h * strafe) * pan_speed * dt
+        ny = y + (sin_h * forward + cos_h * strafe) * pan_speed * dt
 
         nearest = self._nearest_segment_projection(nx, ny)
         if nearest:
-            sx, sy, seg_heading, seg_road, dist = nearest
-            if dist <= DRIVE_LOCK_DIST:
-                snap = min(1.0, dt * (8.0 - 6.0 * (dist / max(DRIVE_LOCK_DIST, 1.0))))
-                road_lanes = max(1, int(getattr(seg_road, "lanes", 1)))
-                road_half_w = min(DRIVE_MAX_LANE_OFFSET, max(2.2, road_lanes * DRIVE_LANE_WIDTH_M * 0.5))
-                lane_shift = (1 if "d" in self._drive_keys else 0) - (1 if "a" in self._drive_keys else 0)
-                self._drive_lane_offset += lane_shift * road_half_w * 0.9 * dt
-                self._drive_lane_offset = max(-road_half_w, min(road_half_w, self._drive_lane_offset))
-                nx_road = -math.sin(seg_heading)
-                ny_road = math.cos(seg_heading)
-                target_x = sx + nx_road * self._drive_lane_offset
-                target_y = sy + ny_road * self._drive_lane_offset
-                nx = nx + (target_x - nx) * snap
-                ny = ny + (target_y - ny) * snap
-                align = min(1.0, dt * 2.5)
-                self._drive_heading = self._lerp_angle(self._drive_heading, seg_heading, align)
-                # Smooth camera elevation to produce ramp transitions between bridge levels.
-                target_elev = float(getattr(seg_road, "bridge_level", 0)) * 2.2
-                self._drive_elev += (target_elev - self._drive_elev) * min(1.0, dt * 2.0)
-                if dist > DRIVE_LOCK_DIST * 0.6:
-                    self._drive_speed *= 0.97
-            elif dist > DRIVE_HARD_LIMIT_DIST:
-                self._drive_speed *= 0.78
+            _sx, _sy, _seg_heading, seg_road, dist = nearest
+            target_elev = float(getattr(seg_road, "bridge_level", 0)) * 2.0
+            if dist < DRIVE_VIEW_DIST * 0.35:
+                self._drive_elev += (target_elev - self._drive_elev) * min(1.0, dt * 1.5)
         else:
-            self._drive_lane_offset *= max(0.0, 1.0 - dt * 1.4)
+            self._drive_elev *= max(0.0, 1.0 - dt)
 
         self._drive_pos = (nx, ny)
         self._draw_drive_scene(nearest)
@@ -2347,8 +2661,8 @@ class App:
         c.delete("all")
 
         horizon = h * 0.36
-        c.create_rectangle(0, 0, w, horizon, fill="#142036", outline="")
-        c.create_rectangle(0, horizon, w, h, fill="#1c1f24", outline="")
+        c.create_rectangle(0, 0, w, horizon, fill="#86b9de", outline="")
+        c.create_rectangle(0, horizon, w, h, fill="#567a4e", outline="")
 
         if self._drive_pos is None:
             return
@@ -2362,9 +2676,9 @@ class App:
         sign_draw = []
 
         def proj(xc, zc, elev=0.0):
-            scale = 760.0 / (zc + 75.0)
+            scale = (760.0 * self._drive_zoom) / (zc + 75.0)
             sx = w * 0.5 + xc * scale
-            sy = horizon + 275.0 / (zc + 48.0) - elev * scale
+            sy = horizon + 290.0 / (zc + 48.0) - elev * scale
             return sx, sy, scale
 
         def draw_building_box(cx, cz, width_world, height_world, depth=0.0, color="#476086"):
@@ -2434,13 +2748,28 @@ class App:
         seg_draw.sort(key=lambda it: it[0], reverse=True)
         b_draw.sort(key=lambda it: it[0], reverse=True)
 
+        band_step = 28
+        for z0 in range(int(near_plane) + 8, int(DRIVE_VIEW_DIST), band_step):
+            z1 = z0 + band_step
+            depth_world = py + cos_h * z0
+            cx = int(px // 120.0)
+            cy = int(depth_world // 120.0)
+            terrain = self._terrain_color_at(cx * 120.0, cy * 120.0)
+            left0, y0, _ = proj(-260, z0, -1.0 - self._drive_elev * 0.1)
+            right0, _, _ = proj(260, z0, -1.0 - self._drive_elev * 0.1)
+            left1, y1, _ = proj(-260, z1, -1.5 - self._drive_elev * 0.1)
+            right1, _, _ = proj(260, z1, -1.5 - self._drive_elev * 0.1)
+            c.create_polygon(left0, y0, right0, y0, right1, y1, left1, y1,
+                             fill=terrain, outline="")
+
         for zc, xc, width, depth, height in b_draw:
             draw_building_box(xc, zc, width, height, depth=depth, color="#4b6388")
 
         for _depth, road, l1x, l1y, r1x, r1y, l2x, l2y, r2x, r2y, elev, lanes, lane_width in seg_draw:
-            road_col = ROAD_STYLES.get(road.rtype, {}).get("color", "#777")
+            road_edge = ROAD_STYLES.get(road.rtype, {}).get("color", "#777")
+            road_fill = self._road_fill_color(road)
             # Deck with ramp/elevation cues.
-            c.create_polygon(l1x, l1y, r1x, r1y, r2x, r2y, l2x, l2y, fill="#2f2c29", outline="")
+            c.create_polygon(l1x, l1y, r1x, r1y, r2x, r2y, l2x, l2y, fill=road_fill, outline="")
             if elev > 0.2:
                 # Side wall shadows for raised roads.
                 wall_drop = max(6, min(26, int(elev * 4)))
@@ -2448,10 +2777,15 @@ class App:
                                  fill="#242424", outline="")
                 c.create_polygon(l1x, l1y, l2x, l2y, l2x, l2y + wall_drop, l1x, l1y + wall_drop,
                                  fill="#1f1f1f", outline="")
-            c.create_line(l1x, l1y, l2x, l2y, fill=road_col, width=2)
-            c.create_line(r1x, r1y, r2x, r2y, fill=road_col, width=2)
-            c.create_line((l1x + r1x) * 0.5, (l1y + r1y) * 0.5, (l2x + r2x) * 0.5, (l2y + r2y) * 0.5,
-                          fill="#d8d2aa", width=1, dash=(5, 6))
+            c.create_line(l1x, l1y, l2x, l2y, fill=road_edge, width=2)
+            c.create_line(r1x, r1y, r2x, r2y, fill=road_edge, width=2)
+            surface = self._effective_surface_texture(road.surface)
+            if surface in ("asphalt", "concrete", "paved"):
+                c.create_line((l1x + r1x) * 0.5, (l1y + r1y) * 0.5, (l2x + r2x) * 0.5, (l2y + r2y) * 0.5,
+                              fill="#e5ddad", width=1, dash=(5, 6))
+            elif surface == "gravel":
+                c.create_line((l1x + r1x) * 0.5, (l1y + r1y) * 0.5, (l2x + r2x) * 0.5, (l2y + r2y) * 0.5,
+                              fill="#cfc2a4", width=1, dash=(2, 7))
             if lanes >= 3:
                 # Extra dashed lane separators for wider roads.
                 off = lane_width * 0.35
@@ -2468,44 +2802,10 @@ class App:
             c.create_oval(sx - 10, sy - pole_h - 10, sx + 10, sy - pole_h + 10, fill="#ffffff", outline="#cc2222", width=2)
             c.create_text(sx, sy - pole_h, text=str(speed_lim), fill="#202020", font=("Consolas", 7, "bold"))
 
-        # Third-person car with visible roof + rear face.
-        cx = w * 0.5
-        base_y = h - 92
-        car_w = 54
-        car_h = 58
-        rear_h = 18
-        c.create_polygon(
-            cx - car_w * 0.5, base_y,
-            cx + car_w * 0.5, base_y,
-            cx + car_w * 0.42, base_y - car_h,
-            cx - car_w * 0.42, base_y - car_h,
-            fill="#c41212",
-            outline="#ffb0b0",
-            width=2,
-        )
-        c.create_polygon(
-            cx - car_w * 0.5, base_y,
-            cx + car_w * 0.5, base_y,
-            cx + car_w * 0.36, base_y + rear_h,
-            cx - car_w * 0.36, base_y + rear_h,
-            fill="#7f0b0b",
-            outline="#3b0606",
-            width=1,
-        )
-        c.create_polygon(
-            cx - car_w * 0.28, base_y - car_h * 0.70,
-            cx + car_w * 0.28, base_y - car_h * 0.70,
-            cx + car_w * 0.22, base_y - car_h * 0.26,
-            cx - car_w * 0.22, base_y - car_h * 0.26,
-            fill="#6a0a0a",
-            outline="#a33",
-        )
-
-        speed_kmh = max(0.0, self._drive_speed * 0.9)
         c.create_text(14, 14, anchor="nw", fill="#dce7ff", font=("Consolas", 11, "bold"),
-                      text=f"Speed: {speed_kmh:5.1f} km/h")
+                      text=f"3D View  |  Zoom {self._drive_zoom:0.2f}x")
         c.create_text(14, 34, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
-                      text="Controls: W/S throttle, A/D steer, Arrow keys supported | Ramps + lane-aware roads")
+                      text="Controls: WASD pan, Q/E orbit, wheel zoom, drag to rotate")
         seg_count = len(seg_draw)
         b_count = len(b_draw)
         fps = self._drive_fps_smooth
@@ -2514,7 +2814,7 @@ class App:
         if nearest:
             _sx, _sy, _ang, road, dist = nearest
             c.create_text(14, 74, anchor="nw", fill="#9db0d8", font=("Consolas", 10),
-                          text=f"Road: {road.name or 'Unnamed'} | L{int(road.bridge_level)} | offset {dist:.1f}")
+                          text=f"Road: {road.name or 'Unnamed'} | {ROAD_TEXTURE_MODES.get(self._road_texture_mode, 'By Surface')} | offset {dist:.1f}")
 
     def apply(self):
         if not self.selected:
@@ -2642,6 +2942,7 @@ class App:
             self._pending_connector = None
             self.current   = []
             self.selected  = None
+            self.hover     = None
             self.graph     = {}
             self._clear_route()
             self.dirty     = True
@@ -2682,6 +2983,7 @@ class App:
             "allow_rust_validator": True,
             "allow_go_validator": True,
             "allow_plugins": True,
+            "prefer_ursina_3d": True,
         }
 
     def _load_runtime_config(self):
@@ -2707,15 +3009,7 @@ class App:
             self._log_exception("Failed to save runtime config", ex, context=POLYGLOT_RUNTIME_CONFIG)
 
     def _recommended_languages_for_os(self, os_choice):
-        os_key = str(os_choice).strip().lower()
-        base = ["rust_router", "js_metrics", "go_metrics", "rust_validator", "go_validator", "plugins"]
-        if os_key.startswith("windows"):
-            return base + ["csharp_metrics", "ruby_metrics", "java_metrics"]
-        if os_key.startswith("debian") or os_key.startswith("linux"):
-            return base + ["ruby_metrics", "java_metrics"]
-        if os_key.startswith("mac"):
-            return base + ["ruby_metrics", "java_metrics"]
-        return base
+        return recommended_language_tokens(profile_by_label(os_choice).key)
 
     def open_polyglot_setup(self, selected_tokens=None):
         if not os.path.exists(POLYGLOT_SETUP_SCRIPT):
@@ -2765,6 +3059,9 @@ class App:
             "last_update_asset_sig": None,
             "plugin_library_url": None,
             "plugin_library_last_refresh": None,
+            "display_mode": "color",
+            "show_labels": False,
+            "road_texture_mode": "surface",
         }
         if os.path.exists(APP_STATE_PATH):
             try:
@@ -2777,6 +3074,19 @@ class App:
             except (OSError, json.JSONDecodeError) as ex:
                 self._log_exception("Failed to load app state", ex, context=APP_STATE_PATH)
         return state
+
+    def _apply_view_preferences(self):
+        state = self._load_app_state()
+        self._display_mode = self._normalize_display_mode(state.get("display_mode", "color"))
+        self._show_names = bool(state.get("show_labels", False))
+        self._road_texture_mode = self._normalize_road_texture_mode(state.get("road_texture_mode", "surface"))
+
+    def _save_view_preferences(self):
+        state = self._load_app_state()
+        state["display_mode"] = self._display_mode
+        state["show_labels"] = bool(self._show_names)
+        state["road_texture_mode"] = self._road_texture_mode
+        self._save_app_state(state)
 
     def _save_app_state(self, state):
         try:
@@ -3236,6 +3546,150 @@ class App:
         state["first_launch_shown_at"] = datetime.now().isoformat(timespec="seconds")
         self._save_app_state(state)
 
+    def _installer_status_lines(self):
+        lines = []
+        for label, path in installer_paths(BASE_DIR):
+            status = "available" if os.path.isdir(path) else "missing"
+            lines.append(f"- {label}: {path} [{status}]")
+        return lines
+
+    def open_onboarding_tutorial(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Onboarding Tutorial")
+        win.geometry("900x640")
+        win.configure(bg=DARK_BG)
+        win.minsize(720, 520)
+
+        title = tk.Label(
+            win,
+            text="RoadGIS Pro Starter Guide",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        )
+        title.pack(fill="x")
+
+        body = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            insertbackground=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 10),
+            padx=12,
+            pady=12,
+        )
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        current = self._platform_profile
+        body.insert(
+            "1.0",
+            f"Current platform profile: {current.label}\n"
+            f"Renderer path: {current.renderer}\n"
+            f"Packaging: {', '.join(current.packaging)}\n"
+            f"Ursina available in this Python: {'Yes' if ursina_available() else 'No'}\n\n"
+            "1) Draw a network\n"
+            "- Use Draw mode and drag to sketch roads quickly.\n"
+            "- Right-click to commit a road.\n"
+            "- Use Select mode to reshape vertices or edit attributes.\n\n"
+            "2) Download offline maps\n"
+            "- File > OSM Mode lets you search by place name or define a bounding box.\n"
+            "- Downloaded maps are cached locally with metadata so you can reopen them later.\n"
+            "- File > Open Cached OSM Library lists saved map installs.\n\n"
+            "3) Explore in 3D\n"
+            "- Press T for the 3D view.\n"
+            "- When Ursina is installed, RoadGISPro launches the cross-platform renderer in a separate window.\n"
+            "- Without Ursina, the built-in pseudo-3D fallback still works.\n\n"
+            "4) Keep it approachable\n"
+            "- Grid, nodes, and labels can be toggled from the View menu.\n"
+            "- Road textures can be switched from the Style menu.\n"
+            "- 3D trees and streetlights are optional for visual clarity.\n\n"
+            "5) Diagnostics and code quality\n"
+            "- Tools > Run Code Audit runs py_compile plus Ruff, mypy, and pylint when installed.\n"
+            "- Runtime logs are stored in your user data directory for bug reports.\n",
+        )
+        body.config(state="disabled")
+
+        btn_bar = tk.Frame(win, bg=DARK_BG)
+        btn_bar.pack(fill="x", padx=12, pady=(0, 12))
+        for text, cmd, color in [
+            ("Download OSM", self.open_osm_download_dialog, ACCENT),
+            ("Cached Maps", self.open_cached_osm_library, "#4a6aa0"),
+            ("Installation Guide", self.open_installation_guide, "#3f8b5f"),
+            ("Run Code Audit", self.open_code_audit_report, "#8a6fb3"),
+        ]:
+            tk.Button(
+                btn_bar,
+                text=text,
+                command=cmd,
+                bg=color,
+                fg="white",
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=6,
+                font=("Consolas", 9, "bold"),
+            ).pack(side="left", padx=4)
+
+    def open_code_audit_report(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Code Audit")
+        win.geometry("920x620")
+        win.configure(bg=DARK_BG)
+        win.minsize(760, 500)
+
+        tk.Label(
+            win,
+            text="Static Analysis and Sanity Checks",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        ).pack(fill="x")
+
+        text = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            insertbackground=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 10),
+            padx=12,
+            pady=12,
+        )
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        text.insert("1.0", "Running audit tools...\n")
+        text.config(state="disabled")
+
+        def apply_results(results):
+            lines = []
+            missing = []
+            for result in results:
+                lines.append(f"[{result.name}] {result.status.upper()} - {result.summary}")
+                lines.append(f"  command: {result.command}")
+                if result.output:
+                    lines.append(result.output[:3000].strip())
+                lines.append("")
+                if result.status == "missing":
+                    missing.append(result.name)
+            if missing:
+                lines.append("Install missing dev tools with: python -m pip install .[dev]")
+            text.config(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", "\n".join(lines).strip() or "No audit results produced.")
+            text.config(state="disabled")
+            self._set_status("Code audit completed")
+
+        def worker():
+            results = run_project_audit(BASE_DIR, os.path.join(BASE_DIR, "RoadGISPro.py"))
+            self.root.after(0, lambda: apply_results(results))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def open_first_time_setup_wizard(self):
         win = tk.Toplevel(self.root)
         win.title(f"{APP_TITLE} - First Time Setup")
@@ -3262,14 +3716,8 @@ class App:
             pady=6,
         ).pack(fill="x")
 
-        os_var = tk.StringVar(value="Windows 11 (active)")
-        os_options = [
-            "Windows 11 (active)",
-            "Debian Linux (coming soon)",
-            "macOS Sonoma (coming soon)",
-            "macOS Sequoia (coming soon)",
-            "macOS Tahoe (coming soon)",
-        ]
+        os_var = tk.StringVar(value=self._platform_profile.label)
+        os_options = profile_choices()
         combo = ttk.Combobox(win, textvariable=os_var, values=os_options, state="readonly", font=("Consolas", 10))
         combo.pack(fill="x", padx=14, pady=6)
 
@@ -3289,11 +3737,12 @@ class App:
         details.insert(
             "1.0",
             "This wizard applies recommended language/runtime settings and opens installation guidance.\n"
-            "It is designed for non-developer onboarding.\n\n"
+            "It is designed for non-developer onboarding across Windows, Debian-family Linux, and recent macOS releases.\n\n"
             "Next steps after Apply:\n"
             "1) Runtime config is created for selected OS profile\n"
             "2) Installation guide opens with beginner-friendly instructions\n"
-            "3) Plugin manager remains available for one-click enable/disable\n",
+            "3) Plugin manager remains available for one-click enable/disable\n"
+            "4) The 3D engine preference stays on Ursina when available\n",
         )
         details.config(state="disabled")
 
@@ -3302,18 +3751,6 @@ class App:
 
         def apply_setup():
             choice = os_var.get()
-            if not str(choice).lower().startswith("windows"):
-                messagebox.showinfo(
-                    "Coming Soon",
-                    "Linux and macOS setup profiles are coming soon. Windows is the only active target today.",
-                )
-                self.open_installation_guide()
-                self._set_status(f"{choice} profile coming soon")
-                try:
-                    win.destroy()
-                except tk.TclError:
-                    pass
-                return
             langs = self._recommended_languages_for_os(choice)
             self.open_polyglot_setup(selected_tokens=langs)
             self.open_installation_guide()
@@ -3382,6 +3819,8 @@ class App:
         framework_note = PLUGIN_FRAMEWORK_PATH
         if not os.path.isdir(PLUGIN_FRAMEWORK_PATH):
             framework_note = f"{PLUGIN_FRAMEWORK_PATH} (not found - clone separately)"
+        installer_text = "\n".join(self._installer_status_lines())
+        current = self._platform_profile
 
         guide = f"""Welcome to RoadGIS Pro.
 
@@ -3394,23 +3833,26 @@ Tools > Open Installation Guide
 - Install built-in plugins via Plugins > Install Built-in Plugins
 - Browse Plugins > Plugin Library for online plugin packs
 - Open Plugins > Plugin Manager and enable desired plugins
+- Open Help > Onboarding Tutorial for a gentler walkthrough
 
 2) Where plugin framework lives
 - Framework path: {framework_note}
 - Clone/share this framework so contributors can build Go/Rust plugins quickly.
 
 3) Platform installer targets
-- Windows 11: .exe and .msi (active)
-- Debian Linux: coming soon
-- macOS Sonoma/Sequoia/Tahoe: coming soon
+- Current platform: {current.label}
+- Renderer preference: {'Ursina when available' if self._runtime_cfg.get('prefer_ursina_3d', True) else 'Built-in fallback'}
+{installer_text}
 
 4) Build installer helper
-- Use Tools > Build Installers for Windows .exe/.msi build instructions.
+- Use Tools > Build Installers for platform-specific PyInstaller guidance.
+- Windows stays paired with Inno Setup for a friendlier installer experience.
 
 5) Diagnostics
 - Runtime config: {POLYGLOT_RUNTIME_CONFIG}
 - App log: {APP_LOG_PATH}
 - Plugin registry: {PLUGIN_REGISTRY_PATH}
+- OSM cache: {osm_cache.cache_root(USER_DATA_DIR)}
 """
         text.insert("1.0", guide)
         text.config(state="disabled")
@@ -3453,26 +3895,32 @@ Tools > Open Installation Guide
             pady=6,
             font=("Consolas", 9, "bold"),
         ).pack(side="left", padx=6)
+        tk.Button(
+            btn_bar,
+            text="Tutorial",
+            command=self.open_onboarding_tutorial,
+            bg="#8a6fb3",
+            fg="white",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=6)
 
     def open_installer_builder_info(self):
-        packaging_dir = os.path.join(BASE_DIR, "installer", "windows-exe")
-        if not os.path.isdir(packaging_dir):
-            messagebox.showwarning(
-                "Build Installers",
-                "Installer build folder not found.\n"
-                "Expected:\n"
-                f"{packaging_dir}\n\n"
-                "Add the Windows installer scripts to the repo to enable EXE/MSI builds.",
-            )
-            return
+        sections = []
+        for label, path in installer_paths(BASE_DIR):
+            status = "present" if os.path.isdir(path) else "missing"
+            sections.append(f"{label}\n{path}\nStatus: {status}")
         msg = (
-            "Windows installer build scripts live here:\n\n"
-            f"{packaging_dir}\n\n"
-            "Targets:\n"
-            "- Windows 11: .exe and .msi workflow scripts (active)\n"
-            "- Debian Linux: coming soon\n"
-            "- macOS Sonoma/Sequoia/Tahoe: coming soon\n\n"
-            "Run the Windows build script in a terminal."
+            "Platform-specific packaging folders:\n\n"
+            + "\n\n".join(sections)
+            + "\n\nRecommended setup:\n"
+            "- Install dev tooling with: python -m pip install .[dev,3d]\n"
+            "- Use the Windows PowerShell builder on Windows\n"
+            "- Use the macOS/Linux shell builders on their native OS\n"
+            "- Ursina remains optional at build time but is preferred for the cross-platform 3D path"
         )
         messagebox.showinfo("Build Installers", msg)
 
@@ -4508,6 +4956,7 @@ Tools > Open Installation Guide
         self._pending_connector = None
         self.current = []
         self.selected = None
+        self.hover = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         for d in payload.get("roads", []):
@@ -4529,12 +4978,181 @@ Tools > Open Installation Guide
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw.strip())
         return cleaned[:64] or "osm_area"
 
+    def _osm_request_label(self, request):
+        if isinstance(request, str):
+            return request
+        label = str(request.get("label") or "").strip()
+        if label:
+            return label
+        if request.get("mode") == "bbox":
+            bbox = request.get("bbox") or []
+            if len(bbox) == 4:
+                south, west, north, east = [float(v) for v in bbox]
+                return f"BBox {south:.3f},{west:.3f} to {north:.3f},{east:.3f}"
+        return str(request.get("query") or "OSM area")
+
+    def _load_cached_osm_entry(self, entry):
+        payload = osm_cache.load_payload(entry)
+        self._apply_payload_to_layer(payload, f"OSM Cache: {entry.label}", mark_dirty=False)
+        self._set_status(
+            f"Loaded cached OSM map '{entry.label}' | roads={entry.feature_count} buildings={entry.structure_count}"
+        )
+
+    def open_cached_osm_library(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} - Cached OSM Library")
+        win.geometry("980x540")
+        win.configure(bg=DARK_BG)
+        win.minsize(760, 420)
+
+        tk.Label(
+            win,
+            text="Cached Offline Maps",
+            bg=DARK_BG,
+            fg=ACCENT,
+            font=("Consolas", 13, "bold"),
+            pady=10,
+        ).pack(fill="x")
+
+        frame = tk.Frame(win, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        cols = ("label", "query", "preset", "source", "created", "roads", "buildings")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=14)
+        for col, title, width in [
+            ("label", "Label", 200),
+            ("query", "Query / BBox", 220),
+            ("preset", "Preset", 80),
+            ("source", "Source", 80),
+            ("created", "Cached At", 140),
+            ("roads", "Roads", 70),
+            ("buildings", "Buildings", 80),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w" if col in {"label", "query", "created"} else "center")
+        tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        detail = tk.Text(
+            win,
+            bg=INPUT_BG,
+            fg=PANEL_FG,
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=("Consolas", 9),
+            padx=10,
+            pady=10,
+            height=6,
+        )
+        detail.pack(fill="x", padx=10, pady=(0, 10))
+        detail.config(state="disabled")
+
+        entries_by_id = {}
+
+        def refresh():
+            tree.delete(*tree.get_children())
+            entries_by_id.clear()
+            for entry in osm_cache.list_entries(USER_DATA_DIR):
+                item_id = tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        entry.label,
+                        entry.query or "(custom bbox)",
+                        entry.preset,
+                        entry.source_kind,
+                        entry.created_at.replace("T", " "),
+                        entry.feature_count,
+                        entry.structure_count,
+                    ),
+                )
+                entries_by_id[item_id] = entry
+
+        def selected_entry():
+            sel = tree.selection()
+            if not sel:
+                return None
+            return entries_by_id.get(sel[0])
+
+        def update_detail(_=None):
+            entry = selected_entry()
+            detail.config(state="normal")
+            detail.delete("1.0", "end")
+            if entry:
+                detail.insert(
+                    "1.0",
+                    f"Label: {entry.label}\n"
+                    f"Query: {entry.query or '(custom bbox)'}\n"
+                    f"Preset: {entry.preset}\n"
+                    f"Source: {entry.source_kind}\n"
+                    f"Cached At: {entry.created_at}\n"
+                    f"Payload: {entry.payload_path}\n"
+                    f"Version: {entry.app_version}\n",
+                )
+            else:
+                detail.insert("1.0", "Select a cached map to inspect it.")
+            detail.config(state="disabled")
+
+        tree.bind("<<TreeviewSelect>>", update_detail)
+
+        btns = tk.Frame(win, bg=DARK_BG)
+        btns.pack(fill="x", padx=10, pady=(0, 12))
+
+        def load_selected():
+            entry = selected_entry()
+            if not entry:
+                messagebox.showwarning("Cached OSM", "Select a cached map first.")
+                return
+            if not self._ask_save():
+                return
+            try:
+                self._load_cached_osm_entry(entry)
+                win.destroy()
+            except (OSError, ValueError, json.JSONDecodeError) as ex:
+                self._log_exception("Failed to load cached OSM payload", ex, context=entry.payload_path)
+                messagebox.showerror("Cached OSM", f"Failed to load cached payload:\n{ex}")
+
+        def delete_selected():
+            entry = selected_entry()
+            if not entry:
+                return
+            if not messagebox.askyesno("Delete Cached Map", f"Remove '{entry.label}' from the cache?"):
+                return
+            osm_cache.remove_entry(USER_DATA_DIR, entry.cache_id)
+            refresh()
+            update_detail()
+
+        for text, cmd, color in [
+            ("Load", load_selected, ACCENT),
+            ("Delete", delete_selected, ACCENT2),
+            ("Refresh", refresh, "#4a6aa0"),
+            ("Download New", self.open_osm_download_dialog, "#3f8b5f"),
+        ]:
+            tk.Button(
+                btns,
+                text=text,
+                command=cmd,
+                bg=color,
+                fg="white",
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=6,
+                font=("Consolas", 9, "bold"),
+            ).pack(side="left", padx=4)
+
+        refresh()
+        update_detail()
+
     def open_osm_download_dialog(self):
         win = tk.Toplevel(self.root)
         win.title("OSM Mode")
-        win.geometry("520x240")
+        win.geometry("620x420")
         win.configure(bg=DARK_BG)
-        win.minsize(420, 220)
+        win.minsize(520, 360)
         win.grab_set()
 
         tk.Label(
@@ -4546,14 +5164,48 @@ Tools > Open Installation Guide
             pady=8,
         ).pack(fill="x")
 
-        area_var = tk.StringVar()
+        mode_var = tk.StringVar(value="search")
+        area_var = tk.StringVar(value="")
         preset_var = tk.StringVar(value=OSM_PRESET_DEFAULT)
         estimate_var = tk.StringVar(value="")
+        use_cache_var = tk.IntVar(value=1)
+        south_var = tk.StringVar(value="32.70")
+        west_var = tk.StringVar(value="-97.10")
+        north_var = tk.StringVar(value="33.05")
+        east_var = tk.StringVar(value="-96.50")
+
+        mode_row = tk.Frame(win, bg=DARK_BG)
+        mode_row.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Radiobutton(
+            mode_row, text="Search place name", variable=mode_var, value="search",
+            bg=DARK_BG, fg=PANEL_FG, selectcolor=INPUT_BG, activebackground=DARK_BG,
+            font=("Consolas", 9),
+        ).pack(side="left")
+        tk.Radiobutton(
+            mode_row, text="Use bounding box", variable=mode_var, value="bbox",
+            bg=DARK_BG, fg=PANEL_FG, selectcolor=INPUT_BG, activebackground=DARK_BG,
+            font=("Consolas", 9),
+        ).pack(side="left", padx=16)
 
         tk.Label(win, text="Area (city, region, or landmark):", bg=DARK_BG, fg=PANEL_FG,
                  font=("Consolas", 9)).pack(fill="x", padx=12)
         tk.Entry(win, textvariable=area_var, bg=INPUT_BG, fg=PANEL_FG,
                  insertbackground=PANEL_FG, relief="flat").pack(fill="x", padx=12, pady=(4, 8))
+
+        bbox = tk.Frame(win, bg=DARK_BG)
+        bbox.pack(fill="x", padx=12, pady=(0, 8))
+        for col in range(4):
+            bbox.columnconfigure(col, weight=1)
+        for idx, (label, var) in enumerate((
+            ("South", south_var), ("West", west_var), ("North", north_var), ("East", east_var),
+        )):
+            tk.Label(bbox, text=label, bg=DARK_BG, fg=PANEL_FG, font=("Consolas", 8)).grid(
+                row=0, column=idx, sticky="w", padx=(0, 6)
+            )
+            tk.Entry(
+                bbox, textvariable=var, bg=INPUT_BG, fg=PANEL_FG,
+                insertbackground=PANEL_FG, relief="flat", font=("Consolas", 9),
+            ).grid(row=1, column=idx, sticky="ew", padx=(0, 6))
 
         tk.Label(win, text="Preset size:", bg=DARK_BG, fg=PANEL_FG,
                  font=("Consolas", 9)).pack(fill="x", padx=12)
@@ -4576,23 +5228,58 @@ Tools > Open Installation Guide
 
         tk.Label(win, textvariable=estimate_var, bg=DARK_BG, fg="#9fb3d8",
                  font=("Consolas", 9)).pack(fill="x", padx=12, pady=(0, 6))
+        tk.Checkbutton(
+            win,
+            text="Use cached payload if a matching offline map already exists",
+            variable=use_cache_var,
+            bg=DARK_BG,
+            fg=PANEL_FG,
+            selectcolor=INPUT_BG,
+            activebackground=DARK_BG,
+            font=("Consolas", 9),
+        ).pack(fill="x", padx=12, pady=(0, 8))
 
         btns = tk.Frame(win, bg=DARK_BG)
         btns.pack(fill="x", padx=12, pady=(6, 10))
 
         def start():
-            area = area_var.get().strip()
-            if not area:
-                messagebox.showwarning("OSM Mode", "Please enter an area name.")
-                return
             if not self._ask_save():
                 return
-            preset = preset_var.get()
+            preset = preset_var.get() or OSM_PRESET_DEFAULT
+            if mode_var.get() == "bbox":
+                try:
+                    south = float(south_var.get())
+                    west = float(west_var.get())
+                    north = float(north_var.get())
+                    east = float(east_var.get())
+                except ValueError:
+                    messagebox.showwarning("OSM Mode", "Bounding box values must be numeric.")
+                    return
+                request = {
+                    "mode": "bbox",
+                    "query": f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}",
+                    "bbox": [south, west, north, east],
+                    "label": f"BBox {south:.3f},{west:.3f} to {north:.3f},{east:.3f}",
+                    "preset": preset,
+                    "prefer_cache": bool(use_cache_var.get()),
+                }
+            else:
+                area = area_var.get().strip()
+                if not area:
+                    messagebox.showwarning("OSM Mode", "Please enter an area name.")
+                    return
+                request = {
+                    "mode": "search",
+                    "query": area,
+                    "label": area,
+                    "preset": preset,
+                    "prefer_cache": bool(use_cache_var.get()),
+                }
             try:
                 win.destroy()
             except tk.TclError:
                 pass
-            self._start_osm_download_job(area, preset)
+            self._start_osm_download_job(request, preset)
 
         tk.Button(
             btns, text="Download", command=start,
@@ -4600,30 +5287,45 @@ Tools > Open Installation Guide
             padx=10, pady=5, font=("Consolas", 9, "bold"),
         ).pack(side="left")
         tk.Button(
+            btns, text="Cached Maps", command=self.open_cached_osm_library,
+            bg="#4a6aa0", fg="white", relief="flat", bd=0,
+            padx=10, pady=5, font=("Consolas", 9, "bold"),
+        ).pack(side="left", padx=8)
+        tk.Button(
             btns, text="Cancel", command=win.destroy,
             bg="#3e4f74", fg="white", relief="flat", bd=0,
             padx=10, pady=5, font=("Consolas", 9, "bold"),
         ).pack(side="left", padx=8)
 
     def _start_osm_download_job(self, area, preset=None):
+        request = area
+        if isinstance(area, str):
+            request = {
+                "mode": "search",
+                "query": area,
+                "label": area,
+                "preset": preset or OSM_PRESET_DEFAULT,
+                "prefer_cache": True,
+            }
+        label = self._osm_request_label(request)
         self._osm_cancel_event = threading.Event()
         self._osm_queue = Queue()
-        self._osm_active_preset = preset or OSM_PRESET_DEFAULT
-        self._set_status(f"OSM download started for '{area}' ({self._osm_active_preset})")
+        self._osm_active_preset = request.get("preset") or preset or OSM_PRESET_DEFAULT
+        self._set_status(f"OSM download started for '{label}' ({self._osm_active_preset})")
 
         def worker():
             try:
-                payload = self._download_osm_payload(area, self._osm_cancel_event, self._osm_queue)
+                display_label, payload = self._download_osm_payload(request, self._osm_cancel_event, self._osm_queue)
                 if self._osm_cancel_event.is_set():
-                    self._osm_queue.put(("cancelled", area, None))
+                    self._osm_queue.put(("cancelled", display_label, None))
                 else:
-                    self._osm_queue.put(("done", area, payload))
+                    self._osm_queue.put(("done", display_label, payload))
             except Exception as ex:
-                self._osm_queue.put(("error", area, str(ex)))
+                self._osm_queue.put(("error", label, str(ex)))
 
         self._osm_job_thread = threading.Thread(target=worker, daemon=True)
         self._osm_job_thread.start()
-        self._open_osm_progress_window(area)
+        self._open_osm_progress_window(label)
         self.root.after(120, self._poll_osm_job)
 
     def _open_osm_progress_window(self, area):
@@ -4722,27 +5424,64 @@ Tools > Open Installation Guide
         self._osm_cancel_event = None
 
     def _download_osm_payload(self, area, cancel_event, progress_q):
-        progress_q.put(("progress", f"Geocoding area '{area}'..."))
-        geo = self._osm_request_json(
-            NOMINATIM_URL,
-            params={"q": area, "format": "jsonv2", "limit": 1},
-            method="GET",
-            timeout=45,
-        )
-        if cancel_event.is_set():
-            return {}
-        if not isinstance(geo, list) or not geo:
-            raise ValueError(f"Area not found: {area}")
-        hit = geo[0]
-        osm_type = str(hit.get("osm_type", "area"))
-        osm_id = str(hit.get("osm_id", "?"))
-        area_tag = f"{osm_type} {osm_id}"
-        display_name = str(hit.get("display_name", area))
-        progress_q.put(("progress", f"Resolved area: {display_name} ({area_tag})"))
-        bbox = hit.get("boundingbox")
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            raise ValueError(f"No bounding box available for: {area}")
-        south, north, west, east = [self._parse_num(v, 0.0) for v in bbox]
+        request = area if isinstance(area, dict) else {
+            "mode": "search",
+            "query": str(area),
+            "label": str(area),
+            "preset": self._osm_active_preset or OSM_PRESET_DEFAULT,
+            "prefer_cache": True,
+        }
+        mode = str(request.get("mode", "search")).strip().lower()
+        query = str(request.get("query", "")).strip()
+        preset = str(request.get("preset") or self._osm_active_preset or OSM_PRESET_DEFAULT)
+        prefer_cache = bool(request.get("prefer_cache", True))
+        bbox_lookup = request.get("bbox") if mode == "bbox" else None
+
+        if prefer_cache:
+            entry = osm_cache.find_entry(
+                USER_DATA_DIR,
+                query=query,
+                bbox=bbox_lookup,
+                preset=preset,
+                source_kind=mode,
+            )
+            if entry is not None:
+                progress_q.put(("progress", f"Loading cached OSM map '{entry.label}'..."))
+                return entry.label, osm_cache.load_payload(entry)
+
+        if mode == "bbox":
+            bbox = request.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                raise ValueError("Bounding box mode requires south, west, north, east values.")
+            south, west, north, east = [self._parse_num(v, 0.0) for v in bbox]
+            display_name = self._osm_request_label(request)
+            area_tag = "custom bbox"
+            progress_q.put(("progress", f"Using custom bounding box for {display_name}..."))
+        else:
+            progress_q.put(("progress", f"Geocoding area '{query}'..."))
+            geo = self._osm_request_json(
+                NOMINATIM_URL,
+                params={"q": query, "format": "jsonv2", "limit": 1},
+                method="GET",
+                timeout=45,
+            )
+            if cancel_event.is_set():
+                return query, {}
+            if not isinstance(geo, list) or not geo:
+                raise ValueError(f"Area not found: {query}")
+            hit = geo[0]
+            osm_type = str(hit.get("osm_type", "area"))
+            osm_id = str(hit.get("osm_id", "?"))
+            area_tag = f"{osm_type} {osm_id}"
+            display_name = str(hit.get("display_name", query))
+            progress_q.put(("progress", f"Resolved area: {display_name} ({area_tag})"))
+            bbox = hit.get("boundingbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                raise ValueError(f"No bounding box available for: {query}")
+            south = self._parse_num(bbox[0], 0.0)
+            north = self._parse_num(bbox[1], 0.0)
+            west = self._parse_num(bbox[2], 0.0)
+            east = self._parse_num(bbox[3], 0.0)
         progress_q.put(("progress", f"Preparing road/building query for {area_tag}..."))
         overpass_query = (
             "[out:json][timeout:80];("
@@ -4843,7 +5582,18 @@ Tools > Open Installation Guide
         if not roads:
             raise ValueError("No roads found in selected area.")
         progress_q.put(("progress", f"Completed parse: roads={len(roads)} buildings={len(structures)}"))
-        return {"roads": roads, "connectors": [], "structures": structures}
+        payload = {"roads": roads, "connectors": [], "structures": structures}
+        osm_cache.store_payload(
+            USER_DATA_DIR,
+            label=display_name,
+            query=query,
+            bbox=bbox_lookup if mode == "bbox" else None,
+            preset=preset,
+            source_kind=mode,
+            app_version=APP_VERSION,
+            payload=payload,
+        )
+        return display_name, payload
 
     def save(self):
         if not self.file:
@@ -5064,6 +5814,7 @@ Tools > Open Installation Guide
             self._pending_connector = None
             self.current  = []
             self.selected = None
+            self.hover = None
             self._undo_stack.clear()
             self._redo_stack.clear()
             skipped = 0
@@ -5097,6 +5848,7 @@ Tools > Open Installation Guide
         self._pending_connector = None
         self.current   = []
         self.selected  = None
+        self.hover     = None
         self.file      = None
         self.dirty     = False
         self.graph     = {}

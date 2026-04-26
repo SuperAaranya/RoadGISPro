@@ -5,6 +5,7 @@ RoadGISPro is a desktop GIS tool for creating and editing road networks, then ru
 ## Highlights
 
 - Draw and edit road geometries with snapping.
+- Drag-to-build road sketching for faster placement.
 - Store rich attributes per road:
   - road class/type
   - speed limit
@@ -17,6 +18,10 @@ RoadGISPro is a desktop GIS tool for creating and editing road networks, then ru
 - Fastest-time routing using road attributes.
 - Undo/redo, copy/paste, zoom fit, layer clearing.
 - Save/load custom `.rgis` format and export/import JSON.
+- Offline OSM import by place search or bounding box.
+- Local cached OSM library for reopening downloaded maps without fetching again.
+- Optional cross-platform Ursina 3D view with a Tkinter fallback renderer.
+- Cross-platform PyInstaller packaging scaffolding for Windows, Debian-family Linux, and macOS.
 
 ## Route Tool
 
@@ -35,6 +40,14 @@ From the project folder:
 python RoadGISPro.py
 ```
 
+Optional development / packaging extras:
+
+```powershell
+python -m pip install .[dev,3d]
+```
+
+This installs the static-analysis tools plus Ursina for the preferred 3D path.
+
 ## Windows Installer (EXE/MSI)
 
 Installer build scripts live in:
@@ -50,6 +63,8 @@ powershell -ExecutionPolicy Bypass -File ".\installer\windows-exe\build_exe.ps1"
 ## Files
 
 - `RoadGISPro.py`: Main application.
+- `roadgis_support/`: Modular helpers for audits, caching, packaging metadata, and Ursina bridging.
+- `installer/`: Platform-specific build helpers.
 - `README.md`: Project overview.
 - `CONTRIBUTING.md`: Contribution standards.
 - `LICENSE`: MIT license.

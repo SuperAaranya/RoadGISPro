@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roadgispro"
+version = "1.0.0"
+description = "Desktop road GIS editor with offline OSM workflows and optional Ursina 3D view."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+3d = ["ursina>=7.0.0"]
+gamepad = ["pygame>=2.5.0"]
+dev = ["pyinstaller>=6.0.0", "ruff>=0.6.0", "mypy>=1.11.0", "pylint>=3.2.0"]
+
+[tool.setuptools]
+py-modules = ["RoadGISPro"]
+packages = ["roadgis_support"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["installer/windows-exe/work", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = false
+exclude = ["installer/windows-exe/work"]
+
+[tool.pylint.main]
+ignore-paths = ["installer/windows-exe/work/.*"]
+
+[tool.pylint.messages_control]
+disable = [
+  "too-many-instance-attributes",
+  "too-many-public-methods",
+  "too-many-statements",
+  "too-many-branches",
+  "too-many-locals",
+  "duplicate-code",
+]
