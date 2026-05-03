@@ -238,6 +238,91 @@ TERRAIN_SWATCHES = {
     "rock": ((101, 108, 118), (144, 152, 160)),
 }
 
+SURFACE_TEXTURE_FALLBACKS = {
+    "paved": "asphalt",
+}
+
+SURFACE_TEXTURE_PROFILES = {
+    "asphalt": {
+        "fill": "#3a3d42",
+        "tone_dark": (45, 48, 52),
+        "tone_light": (86, 88, 92),
+        "edge": "#b8b1a2",
+        "center": "#ece5cb",
+        "repeat_px": 18.0,
+        "strips": 4,
+        "atlas": (
+            (0.32, 0.48, 0.39, 0.57, 0.35, 0.45, 0.29, 0.51),
+            (0.41, 0.28, 0.54, 0.36, 0.49, 0.31, 0.59, 0.38),
+            (0.27, 0.53, 0.33, 0.47, 0.42, 0.58, 0.30, 0.44),
+            (0.55, 0.34, 0.46, 0.29, 0.51, 0.37, 0.43, 0.25),
+        ),
+    },
+    "concrete": {
+        "fill": "#858a89",
+        "tone_dark": (116, 120, 119),
+        "tone_light": (170, 174, 171),
+        "edge": "#d8d3c8",
+        "center": "#f4f0de",
+        "repeat_px": 22.0,
+        "strips": 3,
+        "atlas": (
+            (0.38, 0.52, 0.46, 0.61, 0.44, 0.57, 0.40, 0.54),
+            (0.49, 0.37, 0.58, 0.43, 0.63, 0.47, 0.55, 0.41),
+            (0.45, 0.60, 0.42, 0.56, 0.39, 0.52, 0.48, 0.64),
+        ),
+    },
+    "gravel": {
+        "fill": "#8f816b",
+        "tone_dark": (118, 108, 90),
+        "tone_light": (171, 161, 143),
+        "edge": None,
+        "center": None,
+        "repeat_px": 14.0,
+        "strips": 4,
+        "atlas": (
+            (0.62, 0.41, 0.73, 0.48, 0.68, 0.35, 0.59, 0.44),
+            (0.33, 0.69, 0.45, 0.77, 0.38, 0.64, 0.52, 0.71),
+            (0.57, 0.36, 0.74, 0.43, 0.66, 0.49, 0.61, 0.39),
+            (0.47, 0.72, 0.35, 0.63, 0.54, 0.78, 0.42, 0.67),
+        ),
+    },
+    "dirt": {
+        "fill": "#835936",
+        "tone_dark": (106, 72, 43),
+        "tone_light": (175, 132, 84),
+        "edge": None,
+        "center": None,
+        "repeat_px": 15.0,
+        "strips": 4,
+        "atlas": (
+            (0.41, 0.57, 0.36, 0.62, 0.45, 0.53, 0.33, 0.48),
+            (0.59, 0.34, 0.64, 0.42, 0.55, 0.37, 0.69, 0.46),
+            (0.38, 0.61, 0.44, 0.58, 0.35, 0.66, 0.47, 0.54),
+            (0.63, 0.39, 0.52, 0.31, 0.68, 0.43, 0.57, 0.36),
+        ),
+    },
+    "cobblestone": {
+        "fill": "#7f7566",
+        "tone_dark": (97, 88, 77),
+        "tone_light": (149, 140, 127),
+        "edge": None,
+        "center": None,
+        "repeat_px": 12.0,
+        "strips": 5,
+        "atlas": (
+            (0.24, 0.61, 0.33, 0.72, 0.27, 0.58, 0.35, 0.65),
+            (0.68, 0.29, 0.75, 0.38, 0.63, 0.32, 0.70, 0.41),
+            (0.31, 0.74, 0.40, 0.67, 0.28, 0.79, 0.36, 0.69),
+            (0.71, 0.35, 0.66, 0.26, 0.77, 0.39, 0.62, 0.30),
+            (0.29, 0.64, 0.37, 0.76, 0.34, 0.59, 0.42, 0.73),
+        ),
+    },
+}
+
+ROAD_TEXTURE_MIN_WIDTH = 2.4
+ROAD_TEXTURE_MAX_QUADS = 260
+
 
 def clamp(value, low, high):
     return max(low, min(high, value))
@@ -261,6 +346,10 @@ def _mix_rgb(a, b, t):
 
 def _color_scale(rgb, factor):
     return tuple(clamp(channel * factor, 0, 255) for channel in rgb)
+
+
+def _lerp_point(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
 
 
 def _grid_noise(ix, iy, seed=0):
@@ -1453,11 +1542,18 @@ class App:
 
     def set_display_mode(self, mode):
         self._display_mode = self._normalize_display_mode(mode)
+        auto_enabled_labels = False
+        if self._display_mode == "chart" and not self._show_names:
+            self._show_names = True
+            auto_enabled_labels = True
         self._save_view_preferences()
         self._update_display_mode_buttons()
-        extra = ""
+        extras = []
         if self._display_mode == "color":
-            extra = f"  |  Texture {ROAD_TEXTURE_MODES[self._road_texture_mode]}"
+            extras.append(f"Texture {ROAD_TEXTURE_MODES[self._road_texture_mode]}")
+        if auto_enabled_labels:
+            extras.append("road labels restored")
+        extra = f"  |  {'  |  '.join(extras)}" if extras else ""
         self._set_status(f"Display mode: {DISPLAY_MODES[self._display_mode]}{extra}")
         self.redraw()
 
@@ -1482,9 +1578,20 @@ class App:
         self.redraw()
 
     def _effective_surface_texture(self, surface):
+        surface = str(surface or "").strip().lower()
         if self._road_texture_mode == "surface":
-            return surface if surface in SURFACE_TYPES else "asphalt"
-        return self._road_texture_mode
+            surface = surface if surface in SURFACE_TYPES else "asphalt"
+            return SURFACE_TEXTURE_FALLBACKS.get(surface, surface)
+        return SURFACE_TEXTURE_FALLBACKS.get(self._road_texture_mode, self._road_texture_mode)
+
+    def _road_surface_profile(self, road):
+        surface = self._effective_surface_texture(road.surface)
+        return SURFACE_TEXTURE_PROFILES.get(surface, SURFACE_TEXTURE_PROFILES["asphalt"])
+
+    def _road_display_color(self, road):
+        if self._display_mode == "chart":
+            return ROAD_STYLES.get(road.rtype, {"color": "#aaa"}).get("color", "#aaa")
+        return self._road_surface_profile(road)["fill"]
 
     def cancel_draw(self):
         self.current = []
@@ -1622,7 +1729,20 @@ class App:
             self._draw_terrain(w, h)
 
     def _draw_chart_surface_hint(self, road, flat, width):
-        if road.surface in ("gravel", "dirt"):
+        surface = self._effective_surface_texture(road.surface)
+        if surface in ("asphalt", "paved", "concrete") and width >= 2.6:
+            center_fill = "#eef4ff" if surface == "concrete" else "#d6e2f5"
+            kwargs = {"capstyle": "round", "joinstyle": "round"}
+            if not road.oneway:
+                kwargs["dash"] = (int(max(6, width * 2.2)), int(max(5, width * 1.6)))
+            self.canvas.create_line(
+                *flat,
+                width=max(1, width * 0.16),
+                fill=center_fill,
+                **kwargs,
+            )
+            return
+        if surface in ("gravel", "dirt"):
             self.canvas.create_line(
                 *flat,
                 width=max(1, width * 0.4),
@@ -1632,48 +1752,161 @@ class App:
                 dash=(2, int(max(4, width * 2))),
             )
 
-    def _draw_road_surface_texture(self, road, flat, width):
-        surface = self._effective_surface_texture(road.surface)
-        if surface in ("asphalt", "paved", "concrete"):
-            shoulder = "#f3efe0" if surface == "concrete" else "#d8c78f"
-            center = "#fff8d8" if road.oneway else "#f5f0c7"
-            edge_width = max(1, width * 0.14)
-            self.canvas.create_line(*flat, width=edge_width, fill=shoulder,
-                                    capstyle="round", joinstyle="round")
-            if width >= 2.2:
-                dash = None if road.oneway else (10, 8)
-                kwargs = {"capstyle": "round", "joinstyle": "round"}
-                if dash:
-                    kwargs["dash"] = dash
-                self.canvas.create_line(*flat, width=max(1, width * 0.22), fill=center, **kwargs)
-        elif surface == "gravel":
-            self.canvas.create_line(*flat, width=max(1, width * 0.42), fill="#d8d2bf",
-                                    capstyle="round", joinstyle="round", dash=(2, 6))
-            self.canvas.create_line(*flat, width=max(1, width * 0.18), fill="#8d8572",
-                                    capstyle="round", joinstyle="round", dash=(1, 10))
-        elif surface == "dirt":
-            self.canvas.create_line(*flat, width=max(1, width * 0.36), fill="#b58b59",
-                                    capstyle="round", joinstyle="round", dash=(7, 8))
-            self.canvas.create_line(*flat, width=max(1, width * 0.12), fill="#80552d",
-                                    capstyle="round", joinstyle="round", dash=(1, 11))
+    def _sample_surface_texture_color(self, profile, u, v):
+        # Sample a tiny baked texture atlas using polyline-relative UVs so the
+        # surface pattern stays aligned with the road instead of the screen.
+        atlas = profile["atlas"]
+        rows = len(atlas)
+        cols = len(atlas[0]) if rows else 0
+        if not rows or not cols:
+            return profile["fill"]
+        u_idx = int(math.floor(abs(u) * cols)) % cols
+        v_idx = int(math.floor(clamp(v, 0.0, 0.9999) * rows))
+        tone = atlas[v_idx][u_idx]
+        return _rgb_to_hex(_mix_rgb(profile["tone_dark"], profile["tone_light"], tone))
+
+    def _draw_surface_texture_bands(self, draw_pts, width, profile):
+        if width < ROAD_TEXTURE_MIN_WIDTH or len(draw_pts) < 2:
+            return
+
+        screen_pts = [self.screen(*pt) for pt in draw_pts]
+        strips = max(2, int(profile.get("strips", 3)))
+        repeat_px = max(8.0, float(profile.get("repeat_px", 18.0)))
+        chunk_px = clamp(repeat_px * 0.9, 8.0, 18.0)
+        half_w = max(1.0, width * 0.48)
+        quad_count = 0
+        u_cursor = 0.0
+
+        for i in range(len(screen_pts) - 1):
+            ax, ay = screen_pts[i]
+            bx, by = screen_pts[i + 1]
+            seg_len = math.hypot(bx - ax, by - ay)
+            if seg_len < 2.0:
+                continue
+            nx = -(by - ay) / seg_len
+            ny = (bx - ax) / seg_len
+            chunk_count = max(1, int(math.ceil(seg_len / chunk_px)))
+            for chunk in range(chunk_count):
+                if quad_count >= ROAD_TEXTURE_MAX_QUADS:
+                    return
+                overlap = min(0.18, 1.25 / seg_len)
+                t0 = max(0.0, (chunk / chunk_count) - overlap)
+                t1 = min(1.0, ((chunk + 1) / chunk_count) + overlap)
+                p0 = _lerp_point((ax, ay), (bx, by), t0)
+                p1 = _lerp_point((ax, ay), (bx, by), t1)
+                left0 = (p0[0] + nx * half_w, p0[1] + ny * half_w)
+                right0 = (p0[0] - nx * half_w, p0[1] - ny * half_w)
+                left1 = (p1[0] + nx * half_w, p1[1] + ny * half_w)
+                right1 = (p1[0] - nx * half_w, p1[1] - ny * half_w)
+                u_mid = (u_cursor + seg_len * ((t0 + t1) * 0.5)) / repeat_px
+                for strip in range(strips):
+                    if quad_count >= ROAD_TEXTURE_MAX_QUADS:
+                        return
+                    v0 = strip / strips
+                    v1 = (strip + 1) / strips
+                    a0 = _lerp_point(left0, right0, v0)
+                    a1 = _lerp_point(left0, right0, v1)
+                    b1 = _lerp_point(left1, right1, v1)
+                    b0 = _lerp_point(left1, right1, v0)
+                    fill = self._sample_surface_texture_color(profile, u_mid, (strip + 0.5) / strips)
+                    self.canvas.create_polygon(
+                        a0[0], a0[1],
+                        a1[0], a1[1],
+                        b1[0], b1[1],
+                        b0[0], b0[1],
+                        fill=fill,
+                        outline="",
+                    )
+                    quad_count += 1
+            u_cursor += seg_len
+
+    def _draw_surface_markings(self, road, flat, width, profile):
+        worn_strip = profile.get("edge")
+        center_mark = profile.get("center")
+        major_road = road.rtype in ("motorway", "primary", "secondary", "tertiary")
+
+        if worn_strip and width >= 3.2:
+            self.canvas.create_line(
+                *flat,
+                width=max(1, width * 0.16),
+                fill=worn_strip,
+                capstyle="round",
+                joinstyle="round",
+            )
+        if center_mark and width >= 3.6 and major_road:
+            dash = None if road.oneway else (10, 10)
+            kwargs = {"capstyle": "round", "joinstyle": "round"}
+            if dash:
+                kwargs["dash"] = dash
+            self.canvas.create_line(
+                *flat,
+                width=max(1, width * 0.09),
+                fill=center_mark,
+                **kwargs,
+            )
+
+    def _draw_road_surface_texture(self, road, draw_pts, flat, width):
+        profile = self._road_surface_profile(road)
+        self._draw_surface_texture_bands(draw_pts, width, profile)
+        self._draw_surface_markings(road, flat, width, profile)
 
     def _road_fill_color(self, road):
-        surface = self._effective_surface_texture(road.surface)
-        if surface == "concrete":
-            return "#8d918f"
-        if surface in ("gravel", "cobblestone"):
-            return "#8f816b"
-        if surface == "dirt":
-            return "#895b37"
-        if surface == "paved":
-            return "#42464b"
-        return "#35383d"
+        return self._road_surface_profile(road)["fill"]
 
-    def _draw_road_detail_layer(self, road, flat, width):
+    def _draw_road_detail_layer(self, road, draw_pts, flat, width):
         if self._display_mode == "chart":
             self._draw_chart_surface_hint(road, flat, width)
             return
-        self._draw_road_surface_texture(road, flat, width)
+        self._draw_road_surface_texture(road, draw_pts, flat, width)
+
+    def _road_label_text(self, road):
+        name = str(road.name or "").strip()
+        if name and name != "Unnamed":
+            return name
+        return str(road.ref or "").strip()
+
+    def _road_label_palette(self):
+        if self._display_mode == "chart":
+            return "#f2f6ff", "#06101a"
+        return PANEL_FG, "#080e18"
+
+    def _draw_road_labels(self, road_order):
+        if not self._show_names:
+            return
+
+        fill_color, halo_color = self._road_label_palette()
+        font_size = max(7, min(14, int(9 * self.scale ** 0.2)))
+        font_spec = ("Consolas", font_size, "bold")
+
+        for road in road_order:
+            label_text = self._road_label_text(road)
+            if not label_text:
+                continue
+            smooth_pts = road.geom
+            if len(road.geom) <= 200 or self.scale > 0.8:
+                smooth_pts = smooth_geom(road.geom)
+            min_spacing = max(60, 180 / max(self.scale, 0.01))
+            positions = label_positions(
+                [(p[0], p[1]) for p in smooth_pts],
+                min_spacing_world=min_spacing,
+            )
+            for wx, wy, angle in positions:
+                sx, sy = self.screen(wx, wy)
+                for dx, dy, col in (
+                    (-1, 1, halo_color),
+                    (1, 1, halo_color),
+                    (0, 2, halo_color),
+                    (0, 0, fill_color),
+                ):
+                    self.canvas.create_text(
+                        sx + dx,
+                        sy + dy,
+                        text=label_text,
+                        fill=col,
+                        font=font_spec,
+                        angle=angle,
+                        anchor="center",
+                    )
 
     def redraw(self):
         c = self.canvas
@@ -1727,7 +1960,7 @@ class App:
             is_sel   = r is self.selected
             is_hover = r is self.hover
             style    = ROAD_STYLES.get(r.rtype, {"color": "#aaa", "width": 2})
-            color    = style["color"]
+            color    = self._road_display_color(r)
             width    = style["width"] * max(0.6, self.scale ** 0.32)
             draw_pts = r.geom
             if len(r.geom) <= 200 or self.scale > 0.6:
@@ -1758,7 +1991,7 @@ class App:
             c.create_line(*flat, width=width, fill=color,
                           capstyle="round", joinstyle="round", **dash_args)
 
-            self._draw_road_detail_layer(r, flat, width)
+            self._draw_road_detail_layer(r, draw_pts, flat, width)
 
             if r.oneway:
                 self._draw_oneway_arrows(c, draw_pts, width)
@@ -1802,27 +2035,7 @@ class App:
             sx, sy = self.screen(*self.route_end)
             c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, fill="#f0b90b", outline="white", width=1.5)
 
-        if self._show_names:
-            for r in road_order:
-                name = r.name
-                if not name or name == "Unnamed":
-                    continue
-                smooth_pts = r.geom
-                if len(r.geom) <= 200 or self.scale > 0.8:
-                    smooth_pts = smooth_geom(r.geom)
-                min_spacing = max(60, 180 / max(self.scale, 0.01))
-                positions = label_positions(
-                    [(p[0], p[1]) for p in smooth_pts],
-                    min_spacing_world=min_spacing,
-                )
-                font_size = max(7, min(14, int(9 * self.scale ** 0.2)))
-                font_spec = ("Consolas", font_size, "bold")
-                for wx, wy, angle in positions:
-                    sx, sy = self.screen(wx, wy)
-                    for dx, dy, col in ((-1, 1, "#080e18"), (1, 1, "#080e18"),
-                                        (0, 2, "#080e18"), (0, 0, PANEL_FG)):
-                        c.create_text(sx + dx, sy + dy, text=name, fill=col,
-                                      font=font_spec, angle=angle, anchor="center")
+        self._draw_road_labels(road_order)
 
         if len(self.current) > 1:
             for i in range(len(self.current) - 1):
@@ -3080,6 +3293,8 @@ class App:
         self._display_mode = self._normalize_display_mode(state.get("display_mode", "color"))
         self._show_names = bool(state.get("show_labels", False))
         self._road_texture_mode = self._normalize_road_texture_mode(state.get("road_texture_mode", "surface"))
+        if self._display_mode == "chart" and not self._show_names:
+            self._show_names = True
 
     def _save_view_preferences(self):
         state = self._load_app_state()
