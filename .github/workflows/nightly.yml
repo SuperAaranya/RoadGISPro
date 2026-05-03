@@ -100,6 +100,19 @@ jobs:
         with:
           path: dist
 
+      - name: Remove previous nightly assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          for asset in \
+            RoadGISProSetup.exe \
+            RoadGISPro-macos.zip \
+            RoadGISPro-linux.tar.gz
+          do
+            gh release delete-asset nightly "$asset" --repo "${{ github.repository }}" --yes || true
+          done
+
       - name: Publish nightly release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -107,6 +120,7 @@ jobs:
           name: Nightly
           prerelease: true
           body: Automated nightly build from ${{ github.sha }}
+          overwrite_files: true
           files: |
             dist/RoadGISPro-nightly-windows/*
             dist/RoadGISPro-nightly-macos/*
