@@ -111,3 +111,5 @@ jobs:
             dist/RoadGISPro-windows/*
             dist/RoadGISPro-macos/*
             dist/RoadGISPro-linux/*
+permissions:
+  contents: write
