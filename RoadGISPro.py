@@ -44,11 +44,19 @@ FILE_KEY     = b"RoadGISPro\x7f\x3a\x91\xb4\x2d\xe0\x55\xc8"
 APP_TITLE    = "RoadGIS Pro"
 APP_VERSION  = "1.0.0"
 UPDATE_REPO  = "SuperAaranya/RoadGISPro"
-UPDATE_RELEASE_TAG = "nightly"
+UPDATE_CHANNEL_DEFAULT = "stable"
+UPDATE_NIGHTLY_TAG = "nightly"
 PLUGIN_LIBRARY_URL = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/registry.json"
 PLUGIN_LIBRARY_SITE = "https://superaaranya.github.io/RoadGIS-Plugin-Framework/"
 PLUGIN_LIBRARY_TIMEOUT = 12
 PLUGIN_LIBRARY_CACHE_NAME = "plugin_library_cache.json"
+
+
+def _default_update_channel():
+    version = str(APP_VERSION).lower()
+    if any(token in version for token in ("nightly", "dev", "alpha", "beta", "rc")):
+        return "nightly"
+    return UPDATE_CHANNEL_DEFAULT
 
 
 def _resolve_base_dir():
@@ -726,6 +734,8 @@ class App:
             ("Open Onboarding Tutorial", self.open_onboarding_tutorial),
             ("Report Issue (Create Zip)", self.report_issue_bundle),
             ("Check for Updates", lambda: self._maybe_check_for_updates(force=True)),
+            ("Use Stable Updates", lambda: self._set_update_channel("stable")),
+            ("Use Nightly Updates", lambda: self._set_update_channel("nightly")),
             ("Build Installers", self.open_installer_builder_info),
         ])
 
@@ -3270,6 +3280,7 @@ class App:
             "last_update_check": None,
             "last_update_prompted": None,
             "last_update_asset_sig": None,
+            "update_channel": _default_update_channel(),
             "plugin_library_url": None,
             "plugin_library_last_refresh": None,
             "display_mode": "color",
@@ -3287,6 +3298,25 @@ class App:
             except (OSError, json.JSONDecodeError) as ex:
                 self._log_exception("Failed to load app state", ex, context=APP_STATE_PATH)
         return state
+
+    def _get_update_channel(self):
+        state = self._load_app_state()
+        channel = str(state.get("update_channel") or _default_update_channel()).strip().lower()
+        if channel not in {"stable", "nightly"}:
+            channel = _default_update_channel()
+        return channel
+
+    def _set_update_channel(self, channel):
+        norm = str(channel or "").strip().lower()
+        if norm not in {"stable", "nightly"}:
+            return
+        state = self._load_app_state()
+        state["update_channel"] = norm
+        state["last_update_asset_sig"] = None
+        self._save_app_state(state)
+        label = "Nightly" if norm == "nightly" else "Stable"
+        self._set_status(f"Update channel set to {label}")
+        messagebox.showinfo("Updates", f"RoadGIS Pro will now check the {label} release channel.")
 
     def _apply_view_preferences(self):
         state = self._load_app_state()
@@ -3558,9 +3588,26 @@ class App:
         self._save_app_state(state)
         threading.Thread(target=self._check_for_updates_worker, args=(force,), daemon=True).start()
 
-    def _fetch_latest_release(self):
-        if UPDATE_RELEASE_TAG:
-            url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/tags/{UPDATE_RELEASE_TAG}"
+    def _preferred_update_extensions(self):
+        if sys.platform == "win32":
+            return [".exe", ".msi"]
+        if sys.platform == "darwin":
+            return [".zip", ".dmg", ".pkg"]
+        return [".tar.gz", ".appimage", ".deb", ".rpm", ".zip"]
+
+    def _pick_release_asset(self, assets):
+        preferred = self._preferred_update_extensions()
+        for ext in preferred:
+            for asset in assets:
+                name = str(asset.get("name", "")).lower()
+                if name.endswith(ext):
+                    return asset
+        return None
+
+    def _fetch_latest_release(self, channel=None):
+        release_channel = (channel or self._get_update_channel()).strip().lower()
+        if release_channel == "nightly":
+            url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/tags/{UPDATE_NIGHTLY_TAG}"
         else:
             url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
         req = urllib.request.Request(url, headers={"User-Agent": "RoadGISPro"})
@@ -3580,19 +3627,9 @@ class App:
         tag = data.get("tag_name") or data.get("name") or ""
         body = data.get("body") or ""
         assets = data.get("assets") if isinstance(data.get("assets"), list) else []
-        chosen = None
-        for asset in assets:
-            name = str(asset.get("name", ""))
-            if name.lower().endswith(".exe"):
-                chosen = asset
-                break
-        if not chosen:
-            for asset in assets:
-                name = str(asset.get("name", ""))
-                if name.lower().endswith(".msi"):
-                    chosen = asset
-                    break
+        chosen = self._pick_release_asset(assets)
         return {
+            "channel": release_channel,
             "tag": str(tag),
             "name": str(data.get("name") or tag),
             "body": str(body),
@@ -3614,10 +3651,11 @@ class App:
             if force:
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Updates",
-                    "No installer asset (.exe) was found in the release.",
+                    "No installer asset for this operating system was found in the release.",
                 ))
             return
-        if not UPDATE_RELEASE_TAG or UPDATE_RELEASE_TAG.lower() != "nightly":
+        channel = str(latest.get("channel") or self._get_update_channel()).lower()
+        if channel != "nightly":
             current_v = self._parse_version(APP_VERSION)
             latest_v = self._parse_version(latest.get("tag") or latest.get("name"))
             if latest_v <= current_v:
@@ -3656,10 +3694,10 @@ class App:
         win.minsize(620, 420)
         win.grab_set()
 
-        channel = "Nightly" if UPDATE_RELEASE_TAG and UPDATE_RELEASE_TAG.lower() == "nightly" else "Release"
+        channel_name = "Nightly" if str(latest.get("channel") or self._get_update_channel()).lower() == "nightly" else "Release"
         title = tk.Label(
             win,
-            text=f"{channel} update available: {latest.get('name', '')}",
+            text=f"{channel_name} update available: {latest.get('name', '')}",
             bg=DARK_BG,
             fg=ACCENT,
             font=("Consolas", 13, "bold"),
@@ -3723,7 +3761,7 @@ class App:
         if not isinstance(asset, dict) or not asset.get("browser_download_url"):
             messagebox.showerror(
                 "Update",
-                "No installer asset was found in the latest GitHub release.",
+                "No installer asset for this operating system was found in the selected GitHub release.",
             )
             return
         url = asset["browser_download_url"]
@@ -3744,7 +3782,12 @@ class App:
 
     def _launch_installer(self, path):
         try:
-            subprocess.Popen([path])
+            if sys.platform == "win32":
+                subprocess.Popen([path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
         except OSError as ex:
             self._log_exception("Failed to launch installer", ex, context=path)
             messagebox.showerror("Update", f"Could not launch installer:\n{path}")

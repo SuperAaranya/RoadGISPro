@@ -6,11 +6,9 @@ on:
       - main
 
 jobs:
-  build-nightly:
+  build:
     name: Build nightly ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -18,15 +16,15 @@ jobs:
           - label: Windows
             os: windows-latest
             artifact_name: RoadGISPro-nightly-windows
-            artifact_path: installer/windows-exe/out/RoadGISProSetup-nightly.exe
+            artifact_path: installer/windows-exe/out/RoadGISProSetup.exe
           - label: macOS
             os: macos-latest
             artifact_name: RoadGISPro-nightly-macos
-            artifact_path: installer/macos-pyinstaller/out/RoadGISPro-nightly-macos.zip
+            artifact_path: installer/macos-pyinstaller/out/RoadGISPro-macos.zip
           - label: Linux
             os: ubuntu-latest
             artifact_name: RoadGISPro-nightly-linux
-            artifact_path: installer/linux-pyinstaller/out/RoadGISPro-nightly-linux.tar.gz
+            artifact_path: installer/linux-pyinstaller/out/RoadGISPro-linux.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -48,11 +46,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pwsh .\installer\windows-exe\build_exe.ps1 -Version "0.0.0" -RepoRoot "${{ github.workspace }}"
+          pwsh .\installer\windows-exe\build_exe.ps1 -Version "1.0.0" -RepoRoot "${{ github.workspace }}"
           $out = "installer\\windows-exe\\out"
           $exe = Get-ChildItem $out -Filter "RoadGISProSetup-*.exe" | Select-Object -First 1
           if (-not $exe) { throw "EXE not found in $out" }
-          Copy-Item $exe.FullName "$out\\RoadGISProSetup-nightly.exe" -Force
+          Copy-Item $exe.FullName "$out\\RoadGISProSetup.exe" -Force
 
       - name: Build macOS app
         if: runner.os == 'macOS'
@@ -66,7 +64,7 @@ jobs:
         shell: bash
         run: |
           cd installer/macos-pyinstaller/out
-          ditto -c -k --sequesterRsrc --keepParent RoadGISPro.app RoadGISPro-nightly-macos.zip
+          ditto -c -k --sequesterRsrc --keepParent RoadGISPro.app RoadGISPro-macos.zip
 
       - name: Build Linux app
         if: runner.os == 'Linux'
@@ -80,7 +78,7 @@ jobs:
         shell: bash
         run: |
           cd installer/linux-pyinstaller/out
-          tar -czf RoadGISPro-nightly-linux.tar.gz RoadGISPro
+          tar -czf RoadGISPro-linux.tar.gz RoadGISPro
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -89,14 +87,27 @@ jobs:
           path: ${{ matrix.artifact_path }}
           if-no-files-found: error
 
-      - name: Publish nightly release asset
+  publish-nightly:
+    name: Publish nightly release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download workflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish nightly release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
           name: Nightly
           prerelease: true
           body: Automated nightly build from ${{ github.sha }}
-          append_body: true
-          files: ${{ matrix.artifact_path }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            dist/RoadGISPro-nightly-windows/*
+            dist/RoadGISPro-nightly-macos/*
+            dist/RoadGISPro-nightly-linux/*
