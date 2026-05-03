@@ -1,0 +1,113 @@
+name: desktop-builds
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            artifact_name: RoadGISPro-windows
+            artifact_path: installer/windows-exe/out/RoadGISProSetup-${{ env.APP_VERSION }}.exe
+          - label: macOS
+            os: macos-latest
+            artifact_name: RoadGISPro-macos
+            artifact_path: installer/macos-pyinstaller/out/RoadGISPro-${{ env.APP_VERSION }}-macos.zip
+          - label: Linux
+            os: ubuntu-latest
+            artifact_name: RoadGISPro-linux
+            artifact_path: installer/linux-pyinstaller/out/RoadGISPro-${{ env.APP_VERSION }}-linux.tar.gz
+
+    env:
+      APP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.0.0-ci' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .[dev,3d]
+
+      - name: Install Windows packaging dependencies
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pwsh .\installer\windows-exe\build_exe.ps1 -Version "${env:APP_VERSION}" -RepoRoot "${{ github.workspace }}"
+
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          chmod +x ./installer/macos-pyinstaller/build_app.sh
+          ./installer/macos-pyinstaller/build_app.sh "${APP_VERSION}"
+
+      - name: Package macOS artifact
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd installer/macos-pyinstaller/out
+          ditto -c -k --sequesterRsrc --keepParent RoadGISPro.app "RoadGISPro-${APP_VERSION}-macos.zip"
+
+      - name: Build Linux app
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x ./installer/linux-pyinstaller/build_app.sh
+          ./installer/linux-pyinstaller/build_app.sh "${APP_VERSION}"
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd installer/linux-pyinstaller/out
+          tar -czf "RoadGISPro-${APP_VERSION}-linux.tar.gz" RoadGISPro
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download workflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/RoadGISPro-windows/*
+            dist/RoadGISPro-macos/*
+            dist/RoadGISPro-linux/*
